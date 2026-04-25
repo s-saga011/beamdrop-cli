@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/mdp/qrterminal/v3"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -218,7 +219,8 @@ func runSend(args []string) {
 	if err != nil {
 		die(fmt.Errorf("createRoom: %w", err))
 	}
-	fmt.Printf("Share: %s/r/%s   (or: beamdrop recv %s)\n", server, room, room)
+	shareURL := fmt.Sprintf("%s/r/%s", server, room)
+	printShareInstructions(room, shareURL)
 
 	iceServers, err := fetchICE(server)
 	if err != nil {
@@ -595,6 +597,32 @@ func runRecv(args []string) {
 // ============================================================================
 
 func ptr[T any](v T) *T { return &v }
+
+const installSh = "https://raw.githubusercontent.com/s-saga011/beamdrop-cli/main/install.sh"
+const installPs1 = "https://raw.githubusercontent.com/s-saga011/beamdrop-cli/main/install.ps1"
+
+// printShareInstructions emits a copy-pasteable, install-or-reuse one-liner
+// for each platform, plus an ASCII QR for phone scanning.
+func printShareInstructions(room, shareURL string) {
+	fmt.Println()
+	fmt.Println("┌─ Share with the recipient ──────────────────────────────────────")
+	fmt.Println("│")
+	fmt.Println("│  macOS / Linux (auto-installs CLI if missing):")
+	fmt.Printf("│    curl -fsSL %s | sh -s -- recv %s\n", installSh, room)
+	fmt.Println("│")
+	fmt.Println("│  Windows PowerShell (auto-installs CLI if missing):")
+	fmt.Printf("│    & ([scriptblock]::Create((irm %s))) recv %s\n", installPs1, room)
+	fmt.Println("│")
+	fmt.Println("│  Already installed:")
+	fmt.Printf("│    beamdrop recv %s\n", room)
+	fmt.Println("│")
+	fmt.Printf("│  Share URL: %s\n", shareURL)
+	fmt.Println("└──────────────────────────────────────────────────────────────────")
+	fmt.Println()
+	// QR code for scanning the share URL
+	qrterminal.GenerateHalfBlock(shareURL, qrterminal.L, os.Stdout)
+	fmt.Println()
+}
 
 func formatBytes(n int64) string {
 	const unit = 1024
