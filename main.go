@@ -14,9 +14,12 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"net/url"
@@ -35,7 +38,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.1.2" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.1.4"
+var Version = "v0.1.5"
 
 const (
 	chunkSize     = 256 * 1024
@@ -273,16 +276,27 @@ func runSend(args []string) {
 		close(dcOpen)
 	})
 
-	// Listen for receiver-confirmed completion before tearing down.
+	// Listen for receiver control messages: 'ready' (with resume offset) and 'complete'.
 	completeChan := make(chan struct{}, 1)
+	readyChan := make(chan int64, 1)
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 		if !msg.IsString {
 			return
 		}
 		var m struct {
-			Type string `json:"type"`
+			Type   string `json:"type"`
+			Offset int64  `json:"offset"`
 		}
-		if json.Unmarshal(msg.Data, &m) == nil && m.Type == "complete" {
+		if err := json.Unmarshal(msg.Data, &m); err != nil {
+			return
+		}
+		switch m.Type {
+		case "ready":
+			select {
+			case readyChan <- m.Offset:
+			default:
+			}
+		case "complete":
 			select {
 			case completeChan <- struct{}{}:
 			default:
@@ -343,16 +357,65 @@ func runSend(args []string) {
 		die(fmt.Errorf("timeout waiting for receiver"))
 	}
 
+	// Compute prefix hash so the receiver can verify any existing .part file
+	// belongs to the same source (resume safety check).
+	prefixSize := int64(4096)
+	if totalBytes < prefixSize {
+		prefixSize = totalBytes
+	}
+	prefix := make([]byte, prefixSize)
+	if _, err := file.ReadAt(prefix, 0); err != nil && err != io.EOF {
+		die(fmt.Errorf("read prefix: %w", err))
+	}
+	prefixSum := sha256.Sum256(prefix)
+	prefixHash := hex.EncodeToString(prefixSum[:])
+
 	// Send meta
 	metaJSON, _ := json.Marshal(map[string]any{
-		"type":       "meta",
-		"name":       filepath.Base(path),
-		"size":       totalBytes,
-		"chunkSize":  chunkSize,
+		"type":        "meta",
+		"name":        filepath.Base(path),
+		"size":        totalBytes,
+		"chunkSize":   chunkSize,
 		"totalChunks": (totalBytes + chunkSize - 1) / chunkSize,
+		"prefixHash":  prefixHash,
 	})
 	if err := dc.SendText(string(metaJSON)); err != nil {
 		die(err)
+	}
+
+	// Wait for receiver "ready" with resume offset (0 = fresh start).
+	var startOffset int64
+	select {
+	case startOffset = <-readyChan:
+	case <-time.After(30 * time.Second):
+		die(fmt.Errorf("receiver did not send 'ready' within 30s"))
+	}
+
+	if startOffset >= totalBytes {
+		fmt.Println("Receiver already has the complete file. Sending DONE only.")
+	} else if startOffset > 0 {
+		fmt.Printf("Resuming from offset %s (skipping %s already received)\n",
+			formatBytes(startOffset), formatBytes(startOffset))
+		if _, err := file.Seek(startOffset, 0); err != nil {
+			die(fmt.Errorf("seek to resume offset: %w", err))
+		}
+	}
+
+	// Full-file SHA-256 for end-to-end integrity. For resume cases we have
+	// to pre-hash the bytes we're about to skip so the final digest covers
+	// the entire file.
+	hasher := sha256.New()
+	if startOffset > 0 {
+		fmt.Printf("Pre-hashing %s already-sent prefix...\n", formatBytes(startOffset))
+		ph, err := os.Open(path)
+		if err != nil {
+			die(fmt.Errorf("open for prefix hash: %w", err))
+		}
+		if _, err := io.CopyN(hasher, ph, startOffset); err != nil {
+			ph.Close()
+			die(fmt.Errorf("hash prefix: %w", err))
+		}
+		ph.Close()
 	}
 
 	// Stream file with simple back-pressure on bufferedAmount
@@ -367,50 +430,59 @@ func runSend(args []string) {
 	buf := make([]byte, chunkSize)
 	seqBytes := make([]byte, 4)
 	startT := time.Now()
-	var sent int64
-	var seq uint32
+	sent := startOffset
+	seq := uint32(startOffset / chunkSize)
 	lastReport := startT
-	lastSentBytes := int64(0)
-	for {
-		n, rerr := io.ReadFull(file, buf)
-		if n == 0 && rerr == io.EOF {
-			break
-		}
-		if rerr != nil && rerr != io.ErrUnexpectedEOF && rerr != io.EOF {
-			die(rerr)
-		}
-		// Build [4-byte seq][payload]
-		out := make([]byte, 4+n)
-		binary.BigEndian.PutUint32(seqBytes, seq)
-		copy(out[:4], seqBytes)
-		copy(out[4:], buf[:n])
+	lastSentBytes := startOffset
+	if startOffset < totalBytes {
+		for {
+			n, rerr := io.ReadFull(file, buf)
+			if n == 0 && rerr == io.EOF {
+				break
+			}
+			if rerr != nil && rerr != io.ErrUnexpectedEOF && rerr != io.EOF {
+				die(rerr)
+			}
+			hasher.Write(buf[:n])
+			// Build [4-byte seq][payload]
+			out := make([]byte, 4+n)
+			binary.BigEndian.PutUint32(seqBytes, seq)
+			copy(out[:4], seqBytes)
+			copy(out[4:], buf[:n])
 
-		// Wait for buffer if too full
-		for dc.BufferedAmount() > bufferedHigh {
-			<-bufferLow
-		}
-		if err := dc.Send(out); err != nil {
-			die(fmt.Errorf("send seq=%d: %w", seq, err))
-		}
-		sent += int64(n)
-		seq++
+			// Wait for buffer if too full
+			for dc.BufferedAmount() > bufferedHigh {
+				<-bufferLow
+			}
+			if err := dc.Send(out); err != nil {
+				die(fmt.Errorf("send seq=%d: %w", seq, err))
+			}
+			sent += int64(n)
+			seq++
 
-		now := time.Now()
-		if now.Sub(lastReport) > 500*time.Millisecond {
-			dt := now.Sub(lastReport).Seconds()
-			rate := float64(sent-lastSentBytes) / dt / 1024 / 1024
-			pct := float64(sent) / float64(totalBytes) * 100
-			fmt.Printf("\r  %5.1f%%  %s/%s  %.1f MB/s   ", pct, formatBytes(sent), formatBytes(totalBytes), rate)
-			lastReport = now
-			lastSentBytes = sent
-		}
-		if rerr == io.ErrUnexpectedEOF || rerr == io.EOF {
-			break
+			now := time.Now()
+			if now.Sub(lastReport) > 500*time.Millisecond {
+				dt := now.Sub(lastReport).Seconds()
+				rate := float64(sent-lastSentBytes) / dt / 1024 / 1024
+				pct := float64(sent) / float64(totalBytes) * 100
+				fmt.Printf("\r  %5.1f%%  %s/%s  %.1f MB/s   ", pct, formatBytes(sent), formatBytes(totalBytes), rate)
+				lastReport = now
+				lastSentBytes = sent
+			}
+			if rerr == io.ErrUnexpectedEOF || rerr == io.EOF {
+				break
+			}
 		}
 	}
 
-	// done message
-	doneJSON, _ := json.Marshal(map[string]any{"type": "done", "totalBytes": sent, "chunks": seq})
+	// done message — include full SHA-256 for end-to-end verification
+	fileHash := hex.EncodeToString(hasher.Sum(nil))
+	doneJSON, _ := json.Marshal(map[string]any{
+		"type":       "done",
+		"totalBytes": sent,
+		"chunks":     seq,
+		"fileHash":   fileHash,
+	})
 	_ = dc.SendText(string(doneJSON))
 
 	// Wait for buffer to fully drain so the wire delivery completes.
@@ -501,8 +573,9 @@ func runRecv(args []string) {
 	transferDone := make(chan error, 1)
 
 	var (
-		recvDC       *webrtc.DataChannel
-		transferOK   bool // set true after "done" handler completes successfully
+		recvDC     *webrtc.DataChannel
+		transferOK bool // set true after "done" handler completes successfully
+		hasher     hash.Hash
 	)
 
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
@@ -513,10 +586,11 @@ func runRecv(args []string) {
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			if msg.IsString {
 				var hdr struct {
-					Type      string `json:"type"`
-					Name      string `json:"name"`
-					Size      int64  `json:"size"`
-					ChunkSize int    `json:"chunkSize"`
+					Type       string `json:"type"`
+					Name       string `json:"name"`
+					Size       int64  `json:"size"`
+					ChunkSize  int    `json:"chunkSize"`
+					PrefixHash string `json:"prefixHash"`
 				}
 				_ = json.Unmarshal(msg.Data, &hdr)
 				switch hdr.Type {
@@ -526,27 +600,112 @@ func runRecv(args []string) {
 					meta.Size = hdr.Size
 					meta.ChunkSize = hdr.ChunkSize
 					gotMeta = true
-					f, err := os.Create(meta.Name)
-					if err != nil {
-						transferDone <- err
+					hasher = sha256.New()
+					partPath := meta.Name + ".part"
+					var resumeOffset int64
+
+					// Look for an existing partial file with matching prefix hash.
+					if st, err := os.Stat(partPath); err == nil && st.Size() <= meta.Size {
+						f, ferr := os.Open(partPath)
+						if ferr == nil {
+							prefixSize := int64(4096)
+							if st.Size() < prefixSize {
+								prefixSize = st.Size()
+							}
+							pbuf := make([]byte, prefixSize)
+							n, _ := io.ReadFull(f, pbuf)
+							_ = f.Close()
+							if hdr.PrefixHash != "" {
+								sum := sha256.Sum256(pbuf[:n])
+								if hex.EncodeToString(sum[:]) == hdr.PrefixHash {
+									resumeOffset = st.Size()
+									fmt.Printf("Found %q (%s/%s already received) — resuming\n",
+										partPath, formatBytes(resumeOffset), formatBytes(meta.Size))
+									// Hash the existing prefix so the final digest covers the whole file.
+									ph, herr := os.Open(partPath)
+									if herr == nil {
+										fmt.Printf("Hashing existing %s...\n", formatBytes(resumeOffset))
+										if _, herr := io.CopyN(hasher, ph, resumeOffset); herr != nil {
+											fmt.Fprintf(os.Stderr, "warn: prefix hash failed: %v (full checksum will be off)\n", herr)
+										}
+										ph.Close()
+									}
+								} else {
+									fmt.Printf("Found %q but prefix differs — discarding and starting fresh\n", partPath)
+									_ = os.Remove(partPath)
+								}
+							}
+						}
+					}
+
+					var f *os.File
+					var ferr error
+					if resumeOffset > 0 {
+						f, ferr = os.OpenFile(partPath, os.O_WRONLY, 0644)
+						if ferr == nil {
+							_, ferr = f.Seek(resumeOffset, 0)
+						}
+					} else {
+						f, ferr = os.Create(partPath)
+					}
+					if ferr != nil {
+						transferDone <- ferr
 						mu.Unlock()
 						return
 					}
 					outFile = f
+					received = resumeOffset
 					startT = time.Now()
 					lastReport = startT
+					lastReceivedBytes = resumeOffset
 					mu.Unlock()
-					fmt.Printf("Receiving %q (%s)\n", meta.Name, formatBytes(meta.Size))
+					if resumeOffset == 0 {
+						fmt.Printf("Receiving %q (%s)\n", meta.Name, formatBytes(meta.Size))
+					}
+
+					// Tell sender where to resume from
+					ready, _ := json.Marshal(map[string]any{"type": "ready", "offset": resumeOffset})
+					_ = dc.SendText(string(ready))
 				case "done":
+					var doneHdr struct {
+						FileHash string `json:"fileHash"`
+					}
+					_ = json.Unmarshal(msg.Data, &doneHdr)
+
 					mu.Lock()
 					if outFile != nil {
 						_ = outFile.Sync()
 						_ = outFile.Close()
+						outFile = nil
+					}
+
+					partPath := meta.Name + ".part"
+					var got string
+					if hasher != nil {
+						got = hex.EncodeToString(hasher.Sum(nil))
+					}
+					if doneHdr.FileHash != "" && got != "" && got != doneHdr.FileHash {
+						fmt.Fprintf(os.Stderr, "\nERROR: SHA-256 mismatch (expected %s, got %s). %q kept for inspection.\n",
+							doneHdr.FileHash[:12]+"...", got[:12]+"...", partPath)
+						mu.Unlock()
+						transferDone <- fmt.Errorf("checksum mismatch — partial file left at %s", partPath)
+						return
+					}
+					// Promote .part → final filename
+					if _, err := os.Stat(partPath); err == nil {
+						_ = os.Remove(meta.Name) // overwrite if exists
+						if err := os.Rename(partPath, meta.Name); err != nil {
+							fmt.Fprintf(os.Stderr, "warn: rename %s -> %s: %v\n", partPath, meta.Name, err)
+						}
 					}
 					elapsed := time.Since(startT)
 					rate := float64(received) / elapsed.Seconds() / 1024 / 1024
-					fmt.Printf("\rDone: %s in %s (%.1f MB/s)                     \n",
-						formatBytes(received), elapsed.Round(time.Millisecond), rate)
+					verifyMsg := ""
+					if doneHdr.FileHash != "" && got == doneHdr.FileHash {
+						verifyMsg = " (SHA-256 verified)"
+					}
+					fmt.Printf("\rDone: %s in %s (%.1f MB/s)%s                     \n",
+						formatBytes(received), elapsed.Round(time.Millisecond), rate, verifyMsg)
 					transferOK = true
 					mu.Unlock()
 					// ACK so the sender can safely tear down the WebSocket.
@@ -567,6 +726,9 @@ func runRecv(args []string) {
 					transferDone <- err
 					mu.Unlock()
 					return
+				}
+				if hasher != nil {
+					hasher.Write(payload)
 				}
 				received += int64(len(payload))
 			}
