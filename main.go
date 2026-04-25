@@ -35,7 +35,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.1.2" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.1.3"
+var Version = "v0.1.4"
 
 const (
 	chunkSize     = 256 * 1024
@@ -273,6 +273,23 @@ func runSend(args []string) {
 		close(dcOpen)
 	})
 
+	// Listen for receiver-confirmed completion before tearing down.
+	completeChan := make(chan struct{}, 1)
+	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		if !msg.IsString {
+			return
+		}
+		var m struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(msg.Data, &m) == nil && m.Type == "complete" {
+			select {
+			case completeChan <- struct{}{}:
+			default:
+			}
+		}
+	})
+
 	myPeerID := ""
 	wsRecvDone := make(chan error, 1)
 	go func() {
@@ -396,9 +413,17 @@ func runSend(args []string) {
 	doneJSON, _ := json.Marshal(map[string]any{"type": "done", "totalBytes": sent, "chunks": seq})
 	_ = dc.SendText(string(doneJSON))
 
-	// Wait for buffer to fully drain so we don't close mid-flight
+	// Wait for buffer to fully drain so the wire delivery completes.
 	for dc.BufferedAmount() > 0 {
 		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Wait for the receiver to ACK with {"type":"complete"} so we don't tear
+	// down the WS (which would race a "peer-left" against the final DC chunk).
+	select {
+	case <-completeChan:
+	case <-time.After(30 * time.Second):
+		fmt.Fprintln(os.Stderr, "warning: receiver did not confirm completion within 30s")
 	}
 
 	elapsed := time.Since(startT)
@@ -475,8 +500,14 @@ func runRecv(args []string) {
 
 	transferDone := make(chan error, 1)
 
+	var (
+		recvDC       *webrtc.DataChannel
+		transferOK   bool // set true after "done" handler completes successfully
+	)
+
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		fmt.Printf("DataChannel %q opened\n", dc.Label())
+		recvDC = dc
 		var lastReport time.Time
 		var lastReceivedBytes int64
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
@@ -516,7 +547,11 @@ func runRecv(args []string) {
 					rate := float64(received) / elapsed.Seconds() / 1024 / 1024
 					fmt.Printf("\rDone: %s in %s (%.1f MB/s)                     \n",
 						formatBytes(received), elapsed.Round(time.Millisecond), rate)
+					transferOK = true
 					mu.Unlock()
+					// ACK so the sender can safely tear down the WebSocket.
+					ack, _ := json.Marshal(map[string]any{"type": "complete"})
+					_ = dc.SendText(string(ack))
 					transferDone <- nil
 				}
 				return
@@ -546,7 +581,20 @@ func runRecv(args []string) {
 			}
 			mu.Unlock()
 		})
+		dc.OnClose(func() {
+			// If the DC closed before "done" arrived, that is the real
+			// disconnect signal; report it so the main loop unblocks.
+			mu.Lock()
+			if !transferOK {
+				select {
+				case transferDone <- fmt.Errorf("data channel closed mid-transfer"):
+				default:
+				}
+			}
+			mu.Unlock()
+		})
 	})
+	_ = recvDC
 
 	myPeerID := ""
 	go func() {
@@ -581,8 +629,37 @@ func runRecv(args []string) {
 					_ = pc.AddICECandidate(*msg.Candidate)
 				}
 			case "peer-left":
-				transferDone <- fmt.Errorf("sender disconnected")
-				return
+				// The signaling channel can drop before the final DC chunks
+				// land; rely on dc.OnClose / explicit "done" instead of
+				// killing the transfer here.
+				mu.Lock()
+				if !transferOK && received < meta.Size {
+					// We may still receive remaining buffered DC data —
+					// give the data channel up to 30s to deliver before
+					// declaring failure.
+					go func() {
+						deadline := time.Now().Add(30 * time.Second)
+						for time.Now().Before(deadline) {
+							time.Sleep(500 * time.Millisecond)
+							mu.Lock()
+							ok := transferOK
+							mu.Unlock()
+							if ok {
+								return
+							}
+						}
+						mu.Lock()
+						stillIncomplete := !transferOK
+						mu.Unlock()
+						if stillIncomplete {
+							select {
+							case transferDone <- fmt.Errorf("sender disconnected before transfer completed"):
+							default:
+							}
+						}
+					}()
+				}
+				mu.Unlock()
 			case "error":
 				transferDone <- fmt.Errorf("signaling error: %s", msg.Reason)
 				return
