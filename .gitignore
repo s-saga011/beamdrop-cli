@@ -1,0 +1,5 @@
+/beamdrop
+/beamdrop.exe
+/dist/
+*.test
+.DS_Store
