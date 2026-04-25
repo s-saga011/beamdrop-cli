@@ -41,13 +41,15 @@ if [ -n "$EXISTING" ]; then
   INSTALLED_VER=$("$EXISTING" --version 2>/dev/null || true)
 fi
 
-# Determine latest release tag
+# Determine latest release tag (retry transient 5xx)
 LATEST_VER=""
 if command -v curl >/dev/null 2>&1; then
-  LATEST_VER=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+  LATEST_VER=$(curl -fsSL --retry 3 --retry-delay 2 --retry-connrefused \
+      "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
     | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
 elif command -v wget >/dev/null 2>&1; then
-  LATEST_VER=$(wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+  LATEST_VER=$(wget -qO- --tries=3 --waitretry=2 \
+      "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
     | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
 fi
 
@@ -72,10 +74,11 @@ if [ "$NEED_INSTALL" = "1" ]; then
   URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
   mkdir -p "$INSTALL_DIR"
   echo "Downloading ${ASSET}..."
+  # curl --retry: transient errors include HTTP 408/429/5xx and network issues.
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$URL" -o "$TARGET"
+    curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused "$URL" -o "$TARGET"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q "$URL" -O "$TARGET"
+    wget -q --tries=5 --waitretry=2 "$URL" -O "$TARGET"
   else
     echo "neither curl nor wget found" >&2
     exit 1

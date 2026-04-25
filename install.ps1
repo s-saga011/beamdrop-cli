@@ -35,10 +35,35 @@ if ($Existing) {
     }
 }
 
-# 3. Query latest release tag from GitHub API
+# 3. Query latest release tag from GitHub API (retry transient 5xx)
+function Invoke-WithRetry {
+    param([string]$Uri, [string]$OutFile, [int]$Retries = 5, [int]$Delay = 2)
+    $last = $null
+    for ($i = 1; $i -le $Retries; $i++) {
+        try {
+            if ($OutFile) {
+                Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+                return
+            } else {
+                return Invoke-RestMethod -Uri $Uri -UseBasicParsing -ErrorAction Stop
+            }
+        } catch {
+            $last = $_
+            $code = $null
+            try { $code = $_.Exception.Response.StatusCode.value__ } catch {}
+            if ($i -lt $Retries -and ($code -ge 500 -or $null -eq $code)) {
+                Write-Host "  retry $i/$Retries (status: $(if ($code) { $code } else { 'network' }))" -ForegroundColor DarkGray
+                Start-Sleep -Seconds $Delay
+                continue
+            }
+            throw $last
+        }
+    }
+}
+
 $LatestVer = $null
 try {
-    $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing
+    $rel = Invoke-WithRetry -Uri "https://api.github.com/repos/$Repo/releases/latest"
     $LatestVer = $rel.tag_name
 } catch {
     $LatestVer = $null
@@ -66,7 +91,7 @@ if ($needInstall) {
     $Url   = "https://github.com/$Repo/releases/latest/download/$Asset"
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     Write-Host "Downloading $Asset ..."
-    Invoke-WebRequest -Uri $Url -OutFile $Target -UseBasicParsing
+    Invoke-WithRetry -Uri $Url -OutFile $Target
 
     $newVer = ""
     try { $newVer = (& $Target --version 2>$null | Select-Object -First 1).Trim() } catch {}
