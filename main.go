@@ -38,7 +38,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.1.2" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.1.5"
+var Version = "v0.1.6"
 
 const (
 	chunkSize     = 256 * 1024
@@ -465,7 +465,8 @@ func runSend(args []string) {
 				dt := now.Sub(lastReport).Seconds()
 				rate := float64(sent-lastSentBytes) / dt / 1024 / 1024
 				pct := float64(sent) / float64(totalBytes) * 100
-				fmt.Printf("\r  %5.1f%%  %s/%s  %.1f MB/s   ", pct, formatBytes(sent), formatBytes(totalBytes), rate)
+				fmt.Printf("\r  %s %5.1f%%  %s/%s  %.1f MB/s   ",
+					progressBar(pct, 30), pct, formatBytes(sent), formatBytes(totalBytes), rate)
 				lastReport = now
 				lastSentBytes = sent
 			}
@@ -737,7 +738,8 @@ func runRecv(args []string) {
 				dt := now.Sub(lastReport).Seconds()
 				rate := float64(received-lastReceivedBytes) / dt / 1024 / 1024
 				pct := float64(received) / float64(meta.Size) * 100
-				fmt.Printf("\r  %5.1f%%  %s/%s  %.1f MB/s   ", pct, formatBytes(received), formatBytes(meta.Size), rate)
+				fmt.Printf("\r  %s %5.1f%%  %s/%s  %.1f MB/s   ",
+					progressBar(pct, 30), pct, formatBytes(received), formatBytes(meta.Size), rate)
 				lastReport = now
 				lastReceivedBytes = received
 			}
@@ -952,6 +954,22 @@ func printShareInstructions(room, shareURL string) {
 	// QR code for scanning the share URL
 	qrterminal.GenerateHalfBlock(shareURL, qrterminal.L, os.Stdout)
 	fmt.Println()
+}
+
+// progressBar returns an inline ASCII/Unicode progress bar like
+// "[████████████░░░░░░] 60.0%". width is the number of cells.
+func progressBar(pct float64, width int) string {
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	filled := int(pct/100*float64(width) + 0.5)
+	if filled > width {
+		filled = width
+	}
+	return "[" + strings.Repeat("█", filled) + strings.Repeat("░", width-filled) + "]"
 }
 
 func formatBytes(n int64) string {
