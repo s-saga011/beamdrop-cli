@@ -22,6 +22,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,7 +35,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.1.2" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.1.2"
+var Version = "v0.1.3"
 
 const (
 	chunkSize     = 256 * 1024
@@ -203,6 +205,7 @@ func parseFlags(args []string) (string, []string) {
 // ============================================================================
 
 func runSend(args []string) {
+	checkForUpdate()
 	server, pos := parseFlags(args)
 	if len(pos) < 1 {
 		die(fmt.Errorf("usage: beamdrop send <file>"))
@@ -409,6 +412,7 @@ func runSend(args []string) {
 // ============================================================================
 
 func runRecv(args []string) {
+	checkForUpdate()
 	server, pos := parseFlags(args)
 	if len(pos) < 1 {
 		die(fmt.Errorf("usage: beamdrop recv <url-or-room>"))
@@ -604,6 +608,86 @@ func runRecv(args []string) {
 // ============================================================================
 
 func ptr[T any](v T) *T { return &v }
+
+// checkForUpdate hits GitHub's /releases/latest, compares the tag with
+// our embedded Version, and prints a one-line nudge if a newer version
+// exists. Caches the latest tag in a small temp file for 6h to avoid
+// hammering the API on repeated invocations.
+func checkForUpdate() {
+	if os.Getenv("BEAMDROP_NO_UPDATE_CHECK") == "1" {
+		return
+	}
+
+	cacheDir := filepath.Join(os.TempDir(), "beamdrop")
+	cacheFile := filepath.Join(cacheDir, "latest-tag")
+
+	var latest string
+	// Try cache first
+	if info, err := os.Stat(cacheFile); err == nil && time.Since(info.ModTime()) < 6*time.Hour {
+		if b, err := os.ReadFile(cacheFile); err == nil {
+			latest = strings.TrimSpace(string(b))
+		}
+	}
+
+	// Fall back to GitHub API
+	if latest == "" {
+		client := &http.Client{Timeout: 2 * time.Second}
+		resp, err := client.Get("https://api.github.com/repos/s-saga011/beamdrop-cli/releases/latest")
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+		var r struct {
+			TagName string `json:"tag_name"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+			return
+		}
+		latest = strings.TrimSpace(r.TagName)
+		if latest != "" {
+			_ = os.MkdirAll(cacheDir, 0755)
+			_ = os.WriteFile(cacheFile, []byte(latest), 0644)
+		}
+	}
+
+	if latest == "" || !versionLess(Version, latest) {
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "[beamdrop] update available: %s → %s\n", Version, latest)
+	if runtime.GOOS == "windows" {
+		fmt.Fprintln(os.Stderr, "  irm https://raw.githubusercontent.com/s-saga011/beamdrop-cli/main/install.ps1 | iex")
+	} else {
+		fmt.Fprintln(os.Stderr, "  curl -fsSL https://raw.githubusercontent.com/s-saga011/beamdrop-cli/main/install.sh | sh")
+	}
+	fmt.Fprintln(os.Stderr, "  (set BEAMDROP_NO_UPDATE_CHECK=1 to silence)")
+	fmt.Fprintln(os.Stderr)
+}
+
+// versionLess reports whether a < b for vMAJOR.MINOR.PATCH-style strings.
+// Unparsable components fall through to string comparison.
+func versionLess(a, b string) bool {
+	aa := strings.Split(strings.TrimPrefix(a, "v"), ".")
+	bb := strings.Split(strings.TrimPrefix(b, "v"), ".")
+	n := len(aa)
+	if len(bb) < n {
+		n = len(bb)
+	}
+	for i := 0; i < n; i++ {
+		ai, aerr := strconv.Atoi(aa[i])
+		bi, berr := strconv.Atoi(bb[i])
+		if aerr != nil || berr != nil {
+			if aa[i] != bb[i] {
+				return aa[i] < bb[i]
+			}
+			continue
+		}
+		if ai != bi {
+			return ai < bi
+		}
+	}
+	return len(aa) < len(bb)
+}
 
 const installSh = "https://raw.githubusercontent.com/s-saga011/beamdrop-cli/main/install.sh"
 const installPs1 = "https://raw.githubusercontent.com/s-saga011/beamdrop-cli/main/install.ps1"
