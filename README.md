@@ -7,7 +7,7 @@ where the Web app is capped around 5–8 MB/s).
 Reuses the [beamdrop](https://p2p.draft-publish.com/) signaling server so
 links interoperate across senders/receivers.
 
-## One-line install
+## One-line install (or auto-update)
 
 ### macOS / Linux
 
@@ -21,9 +21,23 @@ curl -fsSL https://raw.githubusercontent.com/s-saga011/beamdrop-cli/main/install
 irm https://raw.githubusercontent.com/s-saga011/beamdrop-cli/main/install.ps1 | iex
 ```
 
-The installer drops a single binary at `~/.local/bin/beamdrop`
-(macOS/Linux) or `%USERPROFILE%\.beamdrop\beamdrop.exe` (Windows).
-Add it to your `PATH` if it isn't already.
+The installer:
+- detects an existing `beamdrop` (skipping download if it's already at the latest tag)
+- otherwise drops a single binary at `~/.local/bin/beamdrop` (macOS/Linux) or
+  `%USERPROFILE%\.beamdrop\beamdrop.exe` (Windows)
+- forwards trailing arguments, so a recipient can install-and-receive in **one** command
+
+```bash
+# install or update if needed, then receive
+curl -fsSL https://raw.githubusercontent.com/s-saga011/beamdrop-cli/main/install.sh | sh -s -- recv ROOM
+```
+
+```powershell
+# install or update if needed, then receive
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/s-saga011/beamdrop-cli/main/install.ps1))) recv ROOM
+```
+
+Same pattern works for `send <file>`. Set `BEAMDROP_FORCE_INSTALL=1` to force a re-download.
 
 ## Usage
 

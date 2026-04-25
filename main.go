@@ -31,6 +31,10 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
+// Version is set via -ldflags "-X main.Version=v0.1.2" at build time;
+// the const fallback keeps `beamdrop --version` honest when run from `go run`.
+var Version = "v0.1.2"
+
 const (
 	chunkSize     = 256 * 1024
 	bufferedHigh  = 16 * 1024 * 1024
@@ -146,6 +150,9 @@ func main() {
 		runSend(os.Args[2:])
 	case "recv":
 		runRecv(os.Args[2:])
+	case "--version", "-v", "version":
+		fmt.Println(Version)
+		return
 	case "--help", "-h", "help":
 		usage()
 	default:
