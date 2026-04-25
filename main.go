@@ -1,26 +1,47 @@
-// beamdrop CLI — minimal pion/webrtc-based file transfer.
+// beamdrop CLI — pion/webrtc-based file transfer.
 //
-// MVP intent: measure raw native WebRTC throughput on platforms where the
-// browser SCTP stack is the bottleneck (notably Windows Chrome ~4.5 MB/s).
+// Implements beamdrop's v3 protocol (browser-compatible) plus optional
+// resume + SHA-256 verification extensions:
 //
-// Protocol (CLI-only, NOT compatible with browser v3 yet):
-//   - Reuses beamdrop signaling: POST /api/rooms, WS /ws/{room}
-//   - Single RTCPeerConnection, single ordered+reliable DataChannel
-//   - Sender pushes binary chunks: [4-byte big-endian seq][payload]
-//   - Sender sends final {"type":"done","totalBytes":N,"chunks":N} JSON
-//   - No encryption (raw transfer for speed measurement)
-//   - 256KB chunks (no Chrome 256KB DC limit on pion)
+//   - Reuses beamdrop signaling: POST /api/rooms, WS /ws/{room},
+//     pcIdx-tagged offer/answer/ice messages.
+//   - 4 RTCPeerConnections; each carries one unordered/maxRetransmits:0 data DC
+//     (label "file-N", N=0..3). pc[0] also carries one reliable+ordered control
+//     DC (label "control") for meta / done / bitmap / complete JSON messages.
+//   - AES-256-GCM per chunk. IV = [0,0,0,0] || BE64(seq). Key shared in the
+//     URL fragment (#k=base64url) so it never reaches the signaling server.
+//   - Wire format for chunks: [4-byte BE seq][AES-GCM ciphertext+tag].
+//   - 16 KB plaintext chunks (matches browser SCTP fragment expectations).
+//   - Receiver reports a bitmap on control every 200 ms; sender retransmits
+//     missing seqs in passes (round-robin across DCs) until receiver sends
+//     {"type":"complete"} or the pass limit is hit.
+//
+// Optional extensions (CLI implements; browser implements where feasible):
+//   - meta.prefixHash: SHA-256 hex of the first 4096 bytes of the source file.
+//     Receivers that find a matching .part file can resume safely.
+//   - "resume" (recv→send): one-shot control message after meta carrying the
+//     receiver's initial bitmap (chunks it already has on disk). The sender
+//     skips those seqs in Phase 1 so resume only retransmits missing chunks.
+//   - done.fileHash: SHA-256 hex of the entire plaintext file. The receiver
+//     verifies after all chunks reassemble. AES-GCM already authenticates
+//     each chunk individually, so this is belt-and-braces; senders MAY omit
+//     it (browser sender currently does, since Web Crypto has no streaming
+//     SHA-256 API).
 package main
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"hash"
 	"io"
+	"math/bits"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,6 +50,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -36,16 +58,159 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-// Version is set via -ldflags "-X main.Version=v0.1.2" at build time;
+// Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.1.8"
+var Version = "v0.2.0"
 
 const (
-	chunkSize     = 256 * 1024
-	bufferedHigh  = 16 * 1024 * 1024
-	bufferedLow   = 4 * 1024 * 1024
-	defaultServer = "https://p2p.draft-publish.com"
+	chunkSize           = 16 * 1024
+	bufferedHigh        = 4 * 1024 * 1024
+	bufferedLow         = 1 * 1024 * 1024
+	numPCs              = 4
+	seqHeaderBytes      = 4
+	ivLength            = 12
+	prefixHashSize      = 4096
+	bitmapInterval      = 200 * time.Millisecond
+	retransmitInterval  = 250 * time.Millisecond
+	maxRetransmitPasses = 10
+	resumeWaitTimeout   = 1500 * time.Millisecond
+	protocolVersion     = 3
+	defaultServer       = "https://p2p.draft-publish.com"
 )
+
+// ============================================================================
+// Helpers: bitmap / base64url / AES-GCM / share URL
+// ============================================================================
+
+// Bitmap layout matches the browser: one bit per seq, LSB-first within byte:
+//   bm[idx>>3] |= 1 << (idx & 7)
+func newBitmap(numBits int) []byte {
+	if numBits <= 0 {
+		return nil
+	}
+	return make([]byte, (numBits+7)/8)
+}
+
+func setBit(bm []byte, idx int) {
+	bm[idx>>3] |= 1 << uint(idx&7)
+}
+
+func getBit(bm []byte, idx int) bool {
+	if bm == nil || idx>>3 >= len(bm) {
+		return false
+	}
+	return (bm[idx>>3]>>uint(idx&7))&1 == 1
+}
+
+func countSetBits(bm []byte) int {
+	c := 0
+	for _, b := range bm {
+		c += bits.OnesCount8(b)
+	}
+	return c
+}
+
+var b64URL = base64.RawURLEncoding
+
+func newAEAD(key []byte) (cipher.AEAD, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+// chunkIV builds the per-chunk IV. Browser writes:
+//   new DataView(iv.buffer).setBigUint64(4, BigInt(seq))
+// — leading 4 zero bytes followed by big-endian uint64(seq).
+func chunkIV(seq uint32) []byte {
+	iv := make([]byte, ivLength)
+	binary.BigEndian.PutUint64(iv[4:], uint64(seq))
+	return iv
+}
+
+func encryptChunk(aead cipher.AEAD, pt []byte, seq uint32) []byte {
+	return aead.Seal(nil, chunkIV(seq), pt, nil)
+}
+
+func decryptChunk(aead cipher.AEAD, ct []byte, seq uint32) ([]byte, error) {
+	return aead.Open(nil, chunkIV(seq), ct, nil)
+}
+
+type shareTarget struct {
+	server string
+	room   string
+	keyB64 string
+}
+
+func extractKeyFromFragment(frag string) string {
+	if frag == "" {
+		return ""
+	}
+	for _, kv := range strings.Split(frag, "&") {
+		if strings.HasPrefix(kv, "k=") {
+			return kv[2:]
+		}
+	}
+	return ""
+}
+
+func parseShareTarget(arg, fallbackServer string) (shareTarget, error) {
+	out := shareTarget{server: fallbackServer}
+	if strings.HasPrefix(arg, "http://") || strings.HasPrefix(arg, "https://") {
+		u, err := url.Parse(arg)
+		if err != nil {
+			return out, fmt.Errorf("parse url: %w", err)
+		}
+		out.server = u.Scheme + "://" + u.Host
+		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+		if len(parts) < 2 || parts[0] != "r" {
+			return out, fmt.Errorf("URL must be of form server/r/ROOM[#k=KEY]")
+		}
+		out.room = parts[1]
+		out.keyB64 = extractKeyFromFragment(u.Fragment)
+		return out, nil
+	}
+	if hashIdx := strings.Index(arg, "#"); hashIdx >= 0 {
+		out.room = arg[:hashIdx]
+		out.keyB64 = extractKeyFromFragment(arg[hashIdx+1:])
+		return out, nil
+	}
+	out.room = arg
+	return out, nil
+}
+
+// hashFilePrefix returns hex-encoded SHA-256 of the first prefixHashSize
+// bytes of file (or the whole file if smaller). Resume safety check.
+func hashFilePrefix(path string, total int64) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	n := int64(prefixHashSize)
+	if total < n {
+		n = total
+	}
+	h := sha256.New()
+	if _, err := io.CopyN(h, f, n); err != nil && err != io.EOF {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func hashFileFull(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
 
 // ============================================================================
 // Signaling
@@ -60,6 +225,7 @@ type sigMsg struct {
 	Reason    string                     `json:"reason,omitempty"`
 	SDP       *webrtc.SessionDescription `json:"sdp,omitempty"`
 	Candidate *webrtc.ICECandidateInit   `json:"candidate,omitempty"`
+	PcIdx     *int                       `json:"pcIdx,omitempty"`
 }
 
 func toWSURL(server, room string) (string, error) {
@@ -142,6 +308,19 @@ func fetchICE(server string) ([]webrtc.ICEServer, error) {
 	return out, nil
 }
 
+// safeWS wraps a *websocket.Conn with a mutex; gorilla/websocket forbids
+// concurrent writers and pion ICE callbacks fire on background goroutines.
+type safeWS struct {
+	conn *websocket.Conn
+	mu   sync.Mutex
+}
+
+func (s *safeWS) write(m sigMsg) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn.WriteJSON(m)
+}
+
 // ============================================================================
 // Main entry
 // ============================================================================
@@ -170,12 +349,12 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `beamdrop CLI — high-speed P2P file transfer
+	fmt.Fprint(os.Stderr, `beamdrop CLI — high-speed P2P file transfer
 
 Usage:
   beamdrop send <file> [--server URL]
-  beamdrop recv <url>             # share URL printed by 'send'
-  beamdrop recv <room> [--server URL]
+  beamdrop recv <url>             # share URL printed by 'send' (must include #k=KEY)
+  beamdrop recv <room#k=KEY> [--server URL]
   beamdrop update                 # download the latest release in place
   beamdrop --version              # print current version
 
@@ -208,6 +387,8 @@ func parseFlags(args []string) (string, []string) {
 	return server, positional
 }
 
+func ptr[T any](v T) *T { return &v }
+
 // ============================================================================
 // Sender
 // ============================================================================
@@ -220,24 +401,38 @@ func runSend(args []string) {
 	}
 	path := pos[0]
 
-	file, err := os.Open(path)
-	if err != nil {
-		die(err)
-	}
-	defer file.Close()
-	stat, err := file.Stat()
+	stat, err := os.Stat(path)
 	if err != nil {
 		die(err)
 	}
 	totalBytes := stat.Size()
+	expectedChunks := int((totalBytes + chunkSize - 1) / chunkSize)
+	if expectedChunks == 0 {
+		expectedChunks = 1
+	}
 
-	fmt.Printf("File: %s (%s)\n", filepath.Base(path), formatBytes(totalBytes))
+	fmt.Printf("File: %s (%s, %d chunks)\n", filepath.Base(path), formatBytes(totalBytes), expectedChunks)
+
+	prefixHash, err := hashFilePrefix(path, totalBytes)
+	if err != nil {
+		die(fmt.Errorf("prefix hash: %w", err))
+	}
+
+	keyBytes := make([]byte, 32)
+	if _, err := rand.Read(keyBytes); err != nil {
+		die(fmt.Errorf("generate key: %w", err))
+	}
+	keyB64 := b64URL.EncodeToString(keyBytes)
+	aead, err := newAEAD(keyBytes)
+	if err != nil {
+		die(err)
+	}
 
 	room, err := createRoom(server)
 	if err != nil {
 		die(fmt.Errorf("createRoom: %w", err))
 	}
-	shareURL := fmt.Sprintf("%s/r/%s", server, room)
+	shareURL := fmt.Sprintf("%s/r/%s#k=%s", server, room, keyB64)
 	printShareInstructions(room, shareURL)
 
 	iceServers, err := fetchICE(server)
@@ -246,268 +441,467 @@ func runSend(args []string) {
 		iceServers = []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}
 	}
 
-	ws, err := dialSignaling(server, room)
+	wsConn, err := dialSignaling(server, room)
 	if err != nil {
 		die(fmt.Errorf("dial signaling: %w", err))
 	}
-	defer ws.Close()
+	defer wsConn.Close()
+	ws := &safeWS{conn: wsConn}
 
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: iceServers})
-	if err != nil {
-		die(err)
-	}
-	defer pc.Close()
-
-	var remotePeerID string
-	var dc *webrtc.DataChannel
-	dcOpen := make(chan struct{})
-
-	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
-		if c == nil || remotePeerID == "" {
-			return
+	pcs := make([]*webrtc.PeerConnection, numPCs)
+	for i := 0; i < numPCs; i++ {
+		pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: iceServers})
+		if err != nil {
+			die(err)
 		}
-		ci := c.ToJSON()
-		_ = ws.WriteJSON(sigMsg{Type: "ice", To: remotePeerID, Candidate: &ci})
-	})
+		pcs[i] = pc
+		defer pc.Close()
+	}
 
-	dc, err = pc.CreateDataChannel("file", &webrtc.DataChannelInit{
-		Ordered: ptr(true),
-	})
+	var remotePeerID atomic.Value
+
+	for i, pc := range pcs {
+		idx := i
+		pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+			if c == nil {
+				return
+			}
+			rid, _ := remotePeerID.Load().(string)
+			if rid == "" {
+				return
+			}
+			ci := c.ToJSON()
+			_ = ws.write(sigMsg{Type: "ice", To: rid, Candidate: &ci, PcIdx: ptr(idx)})
+		})
+	}
+
+	dataDCs := make([]*webrtc.DataChannel, numPCs)
+	bufLow := make([]chan struct{}, numPCs)
+	for i, pc := range pcs {
+		idx := i
+		dc, err := pc.CreateDataChannel(fmt.Sprintf("file-%d", idx), &webrtc.DataChannelInit{
+			Ordered:        ptr(false),
+			MaxRetransmits: ptr(uint16(0)),
+		})
+		if err != nil {
+			die(err)
+		}
+		dc.SetBufferedAmountLowThreshold(bufferedLow)
+		ch := make(chan struct{}, 1)
+		bufLow[idx] = ch
+		dc.OnBufferedAmountLow(func() {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		})
+		dataDCs[idx] = dc
+	}
+	controlDC, err := pcs[0].CreateDataChannel("control", &webrtc.DataChannelInit{Ordered: ptr(true)})
 	if err != nil {
 		die(err)
 	}
-	dc.SetBufferedAmountLowThreshold(bufferedLow)
-	dc.OnOpen(func() {
-		close(dcOpen)
-	})
 
-	// Listen for receiver control messages: 'ready' (with resume offset) and 'complete'.
-	completeChan := make(chan struct{}, 1)
-	readyChan := make(chan int64, 1)
-	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+	totalDCs := numPCs + 1
+	openCh := make(chan struct{}, totalDCs)
+	for _, dc := range dataDCs {
+		dc.OnOpen(func() { openCh <- struct{}{} })
+	}
+	controlDC.OnOpen(func() { openCh <- struct{}{} })
+
+	var (
+		recvBitmapMu  sync.Mutex
+		recvBitmap    []byte
+		recvBitmapVer int64
+	)
+	var transferComplete atomic.Bool
+	var bytesPushed atomic.Int64
+
+	resumeBitmapCh := make(chan []byte, 1)
+	var resumeDelivered atomic.Bool
+
+	controlDC.OnMessage(func(msg webrtc.DataChannelMessage) {
 		if !msg.IsString {
 			return
 		}
 		var m struct {
-			Type   string `json:"type"`
-			Offset int64  `json:"offset"`
+			Type     string `json:"type"`
+			Version  int64  `json:"version"`
+			Received int    `json:"received"`
+			Data     string `json:"data"`
 		}
 		if err := json.Unmarshal(msg.Data, &m); err != nil {
 			return
 		}
 		switch m.Type {
-		case "ready":
+		case "resume":
+			if resumeDelivered.Swap(true) {
+				return
+			}
+			bm, derr := b64URL.DecodeString(m.Data)
+			if derr != nil {
+				return
+			}
 			select {
-			case readyChan <- m.Offset:
+			case resumeBitmapCh <- bm:
 			default:
 			}
+		case "bitmap":
+			recvBitmapMu.Lock()
+			defer recvBitmapMu.Unlock()
+			if m.Version <= recvBitmapVer {
+				return
+			}
+			bm, derr := b64URL.DecodeString(m.Data)
+			if derr != nil {
+				return
+			}
+			recvBitmap = bm
+			recvBitmapVer = m.Version
 		case "complete":
-			select {
-			case completeChan <- struct{}{}:
-			default:
-			}
+			transferComplete.Store(true)
 		}
 	})
 
-	myPeerID := ""
-	wsRecvDone := make(chan error, 1)
+	wsErr := make(chan error, 1)
 	go func() {
 		for {
 			var msg sigMsg
-			if err := ws.ReadJSON(&msg); err != nil {
-				wsRecvDone <- err
+			if err := wsConn.ReadJSON(&msg); err != nil {
+				select {
+				case wsErr <- err:
+				default:
+				}
 				return
+			}
+			idx := 0
+			if msg.PcIdx != nil {
+				idx = *msg.PcIdx
+			}
+			if idx < 0 || idx >= numPCs {
+				idx = 0
 			}
 			switch msg.Type {
 			case "joined":
-				myPeerID = msg.PeerID
 			case "peer-joined":
-				remotePeerID = msg.PeerID
-				offer, err := pc.CreateOffer(nil)
-				if err != nil {
-					wsRecvDone <- err
-					return
+				remotePeerID.Store(msg.PeerID)
+				for i, pc := range pcs {
+					pcIdx := i
+					p := pc
+					go func() {
+						offer, err := p.CreateOffer(nil)
+						if err != nil {
+							return
+						}
+						if err := p.SetLocalDescription(offer); err != nil {
+							return
+						}
+						rid, _ := remotePeerID.Load().(string)
+						_ = ws.write(sigMsg{Type: "offer", To: rid, SDP: &offer, PcIdx: ptr(pcIdx)})
+					}()
 				}
-				if err := pc.SetLocalDescription(offer); err != nil {
-					wsRecvDone <- err
-					return
-				}
-				_ = ws.WriteJSON(sigMsg{Type: "offer", To: remotePeerID, SDP: &offer})
 			case "answer":
-				if msg.SDP != nil {
-					_ = pc.SetRemoteDescription(*msg.SDP)
+				if msg.SDP != nil && pcs[idx] != nil {
+					_ = pcs[idx].SetRemoteDescription(*msg.SDP)
 				}
 			case "ice":
-				if msg.Candidate != nil {
-					_ = pc.AddICECandidate(*msg.Candidate)
+				if msg.Candidate != nil && pcs[idx] != nil {
+					_ = pcs[idx].AddICECandidate(*msg.Candidate)
 				}
 			case "peer-left":
-				wsRecvDone <- fmt.Errorf("receiver disconnected")
-				return
+				if !transferComplete.Load() {
+					select {
+					case wsErr <- fmt.Errorf("receiver disconnected"):
+					default:
+					}
+					return
+				}
 			case "error":
-				wsRecvDone <- fmt.Errorf("signaling error: %s", msg.Reason)
+				select {
+				case wsErr <- fmt.Errorf("signaling error: %s", msg.Reason):
+				default:
+				}
 				return
 			}
 		}
 	}()
-	_ = myPeerID
 
 	fmt.Println("Waiting for receiver...")
-	select {
-	case <-dcOpen:
-		fmt.Println("Connected, starting transfer.")
-	case err := <-wsRecvDone:
-		die(err)
-	case <-time.After(10 * time.Minute):
-		die(fmt.Errorf("timeout waiting for receiver"))
-	}
-
-	// Compute prefix hash so the receiver can verify any existing .part file
-	// belongs to the same source (resume safety check).
-	prefixSize := int64(4096)
-	if totalBytes < prefixSize {
-		prefixSize = totalBytes
-	}
-	prefix := make([]byte, prefixSize)
-	if _, err := file.ReadAt(prefix, 0); err != nil && err != io.EOF {
-		die(fmt.Errorf("read prefix: %w", err))
-	}
-	prefixSum := sha256.Sum256(prefix)
-	prefixHash := hex.EncodeToString(prefixSum[:])
-
-	// Send meta
-	metaJSON, _ := json.Marshal(map[string]any{
-		"type":        "meta",
-		"name":        filepath.Base(path),
-		"size":        totalBytes,
-		"chunkSize":   chunkSize,
-		"totalChunks": (totalBytes + chunkSize - 1) / chunkSize,
-		"prefixHash":  prefixHash,
-	})
-	if err := dc.SendText(string(metaJSON)); err != nil {
-		die(err)
-	}
-
-	// Wait for receiver "ready" with resume offset (0 = fresh start).
-	var startOffset int64
-	select {
-	case startOffset = <-readyChan:
-	case <-time.After(30 * time.Second):
-		die(fmt.Errorf("receiver did not send 'ready' within 30s"))
-	}
-
-	if startOffset >= totalBytes {
-		fmt.Println("Receiver already has the complete file. Sending DONE only.")
-	} else if startOffset > 0 {
-		fmt.Printf("Resuming from offset %s (skipping %s already received)\n",
-			formatBytes(startOffset), formatBytes(startOffset))
-		if _, err := file.Seek(startOffset, 0); err != nil {
-			die(fmt.Errorf("seek to resume offset: %w", err))
-		}
-	}
-
-	// Full-file SHA-256 for end-to-end integrity. For resume cases we have
-	// to pre-hash the bytes we're about to skip so the final digest covers
-	// the entire file.
-	hasher := sha256.New()
-	if startOffset > 0 {
-		fmt.Printf("Pre-hashing %s already-sent prefix...\n", formatBytes(startOffset))
-		ph, err := os.Open(path)
-		if err != nil {
-			die(fmt.Errorf("open for prefix hash: %w", err))
-		}
-		if _, err := io.CopyN(hasher, ph, startOffset); err != nil {
-			ph.Close()
-			die(fmt.Errorf("hash prefix: %w", err))
-		}
-		ph.Close()
-	}
-
-	// Stream file with simple back-pressure on bufferedAmount
-	bufferLow := make(chan struct{}, 1)
-	dc.OnBufferedAmountLow(func() {
+	opened := 0
+	openTimeout := time.NewTimer(10 * time.Minute)
+	defer openTimeout.Stop()
+	for opened < totalDCs {
 		select {
-		case bufferLow <- struct{}{}:
-		default:
-		}
-	})
-
-	buf := make([]byte, chunkSize)
-	seqBytes := make([]byte, 4)
-	startT := time.Now()
-	sent := startOffset
-	seq := uint32(startOffset / chunkSize)
-	lastReport := startT
-	lastSentBytes := startOffset
-	if startOffset < totalBytes {
-		for {
-			n, rerr := io.ReadFull(file, buf)
-			if n == 0 && rerr == io.EOF {
-				break
-			}
-			if rerr != nil && rerr != io.ErrUnexpectedEOF && rerr != io.EOF {
-				die(rerr)
-			}
-			hasher.Write(buf[:n])
-			// Build [4-byte seq][payload]
-			out := make([]byte, 4+n)
-			binary.BigEndian.PutUint32(seqBytes, seq)
-			copy(out[:4], seqBytes)
-			copy(out[4:], buf[:n])
-
-			// Wait for buffer if too full
-			for dc.BufferedAmount() > bufferedHigh {
-				<-bufferLow
-			}
-			if err := dc.Send(out); err != nil {
-				die(fmt.Errorf("send seq=%d: %w", seq, err))
-			}
-			sent += int64(n)
-			seq++
-
-			now := time.Now()
-			if now.Sub(lastReport) > 500*time.Millisecond {
-				dt := now.Sub(lastReport).Seconds()
-				rate := float64(sent-lastSentBytes) / dt / 1024 / 1024
-				pct := float64(sent) / float64(totalBytes) * 100
-				fmt.Printf("\r  %s %5.1f%%  %s/%s  %.1f MB/s   ",
-					progressBar(pct, 30), pct, formatBytes(sent), formatBytes(totalBytes), rate)
-				lastReport = now
-				lastSentBytes = sent
-			}
-			if rerr == io.ErrUnexpectedEOF || rerr == io.EOF {
-				break
-			}
+		case <-openCh:
+			opened++
+		case err := <-wsErr:
+			die(err)
+		case <-openTimeout.C:
+			die(fmt.Errorf("timeout waiting for receiver to connect"))
 		}
 	}
+	fmt.Println("Connected, starting transfer.")
 
-	// done message — include full SHA-256 for end-to-end verification
-	fileHash := hex.EncodeToString(hasher.Sum(nil))
-	doneJSON, _ := json.Marshal(map[string]any{
-		"type":       "done",
-		"totalBytes": sent,
-		"chunks":     seq,
-		"fileHash":   fileHash,
+	mime := "application/octet-stream"
+	metaJSON, _ := json.Marshal(map[string]any{
+		"type":            "meta",
+		"name":            filepath.Base(path),
+		"size":            totalBytes,
+		"mime":            mime,
+		"chunkSize":       chunkSize,
+		"totalChunks":     expectedChunks,
+		"protocolVersion": protocolVersion,
+		"prefixHash":      prefixHash,
 	})
-	_ = dc.SendText(string(doneJSON))
+	if err := controlDC.SendText(string(metaJSON)); err != nil {
+		die(fmt.Errorf("send meta: %w", err))
+	}
 
-	// Wait for buffer to fully drain so the wire delivery completes.
-	for dc.BufferedAmount() > 0 {
+	// Wait briefly for the receiver to send a "resume" message with its
+	// initial bitmap. If they don't, treat as full transfer.
+	var resumeBitmap []byte
+	select {
+	case bm := <-resumeBitmapCh:
+		resumeBitmap = bm
+		setCount := countSetBits(resumeBitmap)
+		if setCount > 0 {
+			fmt.Printf("Receiver already has %d/%d chunks — resuming transfer\n", setCount, expectedChunks)
+		}
+	case <-time.After(resumeWaitTimeout):
+		// Fresh transfer (receiver doesn't support resume or has nothing).
+	}
+
+	sendStart := time.Now()
+	var lastReportMu sync.Mutex
+	lastReport := sendStart
+	var lastPushed int64
+
+	sendChunk := func(dc *webrtc.DataChannel, ch chan struct{}, seq uint32, plaintext []byte) error {
+		ct := encryptChunk(aead, plaintext, seq)
+		out := make([]byte, seqHeaderBytes+len(ct))
+		binary.BigEndian.PutUint32(out[:seqHeaderBytes], seq)
+		copy(out[seqHeaderBytes:], ct)
+		for dc.BufferedAmount() > bufferedHigh {
+			if transferComplete.Load() {
+				return nil
+			}
+			select {
+			case <-ch:
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
+		if err := dc.Send(out); err != nil {
+			return err
+		}
+		bytesPushed.Add(int64(len(plaintext)))
+
+		now := time.Now()
+		lastReportMu.Lock()
+		shouldReport := now.Sub(lastReport) > 500*time.Millisecond
+		var pushed, lastP int64
+		var dt float64
+		if shouldReport {
+			pushed = bytesPushed.Load()
+			lastP = lastPushed
+			dt = now.Sub(lastReport).Seconds()
+			lastReport = now
+			lastPushed = pushed
+		}
+		lastReportMu.Unlock()
+		if shouldReport {
+			rate := float64(pushed-lastP) / dt / 1024 / 1024
+			pct := float64(pushed) / float64(totalBytes) * 100
+			if totalBytes == 0 {
+				pct = 100
+			}
+			fmt.Printf("\r  %s %5.1f%%  %s/%s  %.1f MB/s   ",
+				progressBar(pct, 30), pct, formatBytes(pushed), formatBytes(totalBytes), rate)
+		}
+		return nil
+	}
+
+	type chunkData struct {
+		seq uint32
+		pt  []byte
+	}
+
+	// Phase 1: producer reads file sequentially (so we can compute fileHash
+	// on the fly), dispatches chunks to a fan-out channel that the workers
+	// consume. Resume-bitmap-acked chunks are skipped (not enqueued, but
+	// they are still hashed so the final fileHash covers the whole file).
+	chunks := make(chan chunkData, 64)
+	var producerErr atomic.Value
+	var fileHash atomic.Value
+
+	go func() {
+		defer close(chunks)
+		f, err := os.Open(path)
+		if err != nil {
+			producerErr.Store(err)
+			return
+		}
+		defer f.Close()
+		hasher := sha256.New()
+		buf := make([]byte, chunkSize)
+		seq := uint32(0)
+		for {
+			if transferComplete.Load() {
+				break
+			}
+			n, rerr := io.ReadFull(f, buf)
+			if n > 0 {
+				hasher.Write(buf[:n])
+				if !getBit(resumeBitmap, int(seq)) {
+					ptCopy := make([]byte, n)
+					copy(ptCopy, buf[:n])
+					chunks <- chunkData{seq: seq, pt: ptCopy}
+				}
+				seq++
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr == io.ErrUnexpectedEOF {
+				break
+			}
+			if rerr != nil {
+				producerErr.Store(rerr)
+				return
+			}
+		}
+		fileHash.Store(hex.EncodeToString(hasher.Sum(nil)))
+	}()
+
+	sentBitmap := newBitmap(expectedChunks)
+	var sentMu sync.Mutex
+	var wg sync.WaitGroup
+	for i := 0; i < numPCs; i++ {
+		wg.Add(1)
+		idx := i
+		go func() {
+			defer wg.Done()
+			dc := dataDCs[idx]
+			ch := bufLow[idx]
+			for cd := range chunks {
+				if transferComplete.Load() {
+					return
+				}
+				if err := sendChunk(dc, ch, cd.seq, cd.pt); err != nil {
+					return
+				}
+				sentMu.Lock()
+				setBit(sentBitmap, int(cd.seq))
+				sentMu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if v := producerErr.Load(); v != nil {
+		die(fmt.Errorf("read file: %w", v.(error)))
+	}
+
+	// Phase 1 done — tell receiver and include fileHash for end-to-end verify.
+	finalHash, _ := fileHash.Load().(string)
+	doneMsg := map[string]any{"type": "done"}
+	if finalHash != "" {
+		doneMsg["fileHash"] = finalHash
+	}
+	doneJSON, _ := json.Marshal(doneMsg)
+	_ = controlDC.SendText(string(doneJSON))
+
+	// Phase 2: bitmap-driven retransmit. Random access via ReadAt.
+	pass := 0
+	for pass < maxRetransmitPasses && !transferComplete.Load() {
+		select {
+		case err := <-wsErr:
+			die(err)
+		case <-time.After(retransmitInterval):
+		}
+		if transferComplete.Load() {
+			break
+		}
+		recvBitmapMu.Lock()
+		bm := recvBitmap
+		recvBitmapMu.Unlock()
+		if bm == nil {
+			continue
+		}
+		var missing []uint32
+		for s := 0; s < expectedChunks; s++ {
+			if !getBit(bm, s) {
+				missing = append(missing, uint32(s))
+				if len(missing) >= 50000 {
+					break
+				}
+			}
+		}
+		if len(missing) == 0 {
+			continue
+		}
+		pass++
+		fmt.Printf("\n  retransmit pass %d: %d missing chunks\n", pass, len(missing))
+		f, err := os.Open(path)
+		if err != nil {
+			die(fmt.Errorf("reopen for retransmit: %w", err))
+		}
+		for i, s := range missing {
+			if transferComplete.Load() {
+				break
+			}
+			offset := int64(s) * chunkSize
+			size := int64(chunkSize)
+			if offset+size > totalBytes {
+				size = totalBytes - offset
+			}
+			if size <= 0 {
+				continue
+			}
+			pt := make([]byte, size)
+			if _, err := f.ReadAt(pt, offset); err != nil && err != io.EOF {
+				f.Close()
+				die(fmt.Errorf("readat seq=%d: %w", s, err))
+			}
+			dc := dataDCs[i%numPCs]
+			ch := bufLow[i%numPCs]
+			if err := sendChunk(dc, ch, s, pt); err != nil {
+				break
+			}
+		}
+		f.Close()
+	}
+
+	// Drain remaining DC buffers so the wire delivery completes.
+	drainStart := time.Now()
+	for {
+		any := false
+		for _, dc := range dataDCs {
+			if dc.BufferedAmount() > 0 {
+				any = true
+				break
+			}
+		}
+		if !any || time.Since(drainStart) > 10*time.Second {
+			break
+		}
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	// Wait for the receiver to ACK with {"type":"complete"} so we don't tear
-	// down the WS (which would race a "peer-left" against the final DC chunk).
-	select {
-	case <-completeChan:
-	case <-time.After(30 * time.Second):
-		fmt.Fprintln(os.Stderr, "warning: receiver did not confirm completion within 30s")
+	if !transferComplete.Load() {
+		select {
+		case <-time.After(15 * time.Second):
+		}
+	}
+	if !transferComplete.Load() {
+		fmt.Fprintln(os.Stderr)
+		die(fmt.Errorf("retransmit limit reached or timeout — receiver did not confirm completion"))
 	}
 
-	elapsed := time.Since(startT)
-	rate := float64(sent) / elapsed.Seconds() / 1024 / 1024
-	fmt.Printf("\rDone: %s in %s (%.1f MB/s)                       \n",
-		formatBytes(sent), elapsed.Round(time.Millisecond), rate)
+	elapsed := time.Since(sendStart)
+	pushed := bytesPushed.Load()
+	rate := float64(totalBytes) / elapsed.Seconds() / 1024 / 1024
+	fmt.Printf("\rDone: %s in %s (%.1f MB/s, pushed %s incl. retransmits)             \n",
+		formatBytes(totalBytes), elapsed.Round(time.Millisecond), rate, formatBytes(pushed))
 }
 
 // ============================================================================
@@ -521,19 +915,31 @@ func runRecv(args []string) {
 		die(fmt.Errorf("usage: beamdrop recv <url-or-room>"))
 	}
 	target := pos[0]
-	room := target
-	if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
-		// Parse URL like https://server/r/ROOM
-		u, err := url.Parse(target)
-		if err != nil {
-			die(fmt.Errorf("parse url: %w", err))
-		}
-		server = u.Scheme + "://" + u.Host
-		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-		if len(parts) < 2 || parts[0] != "r" {
-			die(fmt.Errorf("URL must be of form server/r/ROOM"))
-		}
-		room = parts[1]
+
+	st, err := parseShareTarget(target, server)
+	if err != nil {
+		die(err)
+	}
+	if st.server != "" {
+		server = st.server
+	}
+	room := st.room
+	if room == "" {
+		die(fmt.Errorf("could not parse room id from %q", target))
+	}
+	if st.keyB64 == "" {
+		die(fmt.Errorf("share target is missing the encryption key (#k=KEY). Ask the sender for the full URL printed by 'beamdrop send'."))
+	}
+	keyBytes, err := b64URL.DecodeString(st.keyB64)
+	if err != nil {
+		die(fmt.Errorf("decode key: %w", err))
+	}
+	if len(keyBytes) != 32 {
+		die(fmt.Errorf("key must be 256 bits, got %d", len(keyBytes)*8))
+	}
+	aead, err := newAEAD(keyBytes)
+	if err != nil {
+		die(err)
 	}
 
 	iceServers, err := fetchICE(server)
@@ -542,300 +948,471 @@ func runRecv(args []string) {
 		iceServers = []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}
 	}
 
-	ws, err := dialSignaling(server, room)
+	wsConn, err := dialSignaling(server, room)
 	if err != nil {
 		die(fmt.Errorf("dial signaling: %w", err))
 	}
-	defer ws.Close()
+	defer wsConn.Close()
+	ws := &safeWS{conn: wsConn}
 
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: iceServers})
-	if err != nil {
-		die(err)
-	}
-	defer pc.Close()
+	pcs := make([]*webrtc.PeerConnection, numPCs)
+	var pcsMu sync.Mutex
+	var remotePeerID atomic.Value
+	defer func() {
+		pcsMu.Lock()
+		defer pcsMu.Unlock()
+		for _, pc := range pcs {
+			if pc != nil {
+				_ = pc.Close()
+			}
+		}
+	}()
 
-	var remotePeerID string
 	var (
-		mu          sync.Mutex
-		meta        struct {
-			Name      string `json:"name"`
-			Size      int64  `json:"size"`
-			ChunkSize int    `json:"chunkSize"`
-		}
-		outFile  *os.File
-		startT   time.Time
-		received int64
-		gotMeta  bool
+		stMu          sync.Mutex
+		gotMeta       bool
+		metaName      string
+		metaSize      int64
+		metaChunkSize int64
+		metaChunks    int
+		metaFileHash  string
+		outFile       *os.File
+		recvBitmap    []byte
+		receivedCount int
+		receivedBytes int64
+		startT        time.Time
+		finished      bool
+		lastReport    time.Time
+		lastReceived  int64
+		expectedHash  string
 	)
-
-	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
-		if c == nil || remotePeerID == "" {
-			return
-		}
-		ci := c.ToJSON()
-		_ = ws.WriteJSON(sigMsg{Type: "ice", To: remotePeerID, Candidate: &ci})
-	})
+	type pendingChunk struct {
+		seq uint32
+		pt  []byte
+	}
+	var pending []pendingChunk
 
 	transferDone := make(chan error, 1)
+	var controlDC atomic.Value
 
-	var (
-		recvDC     *webrtc.DataChannel
-		transferOK bool // set true after "done" handler completes successfully
-		hasher     hash.Hash
-	)
+	storeChunk := func(seq uint32, pt []byte) bool {
+		if outFile == nil || recvBitmap == nil {
+			return false
+		}
+		if int(seq) >= metaChunks {
+			return false
+		}
+		if getBit(recvBitmap, int(seq)) {
+			return false
+		}
+		offset := int64(seq) * metaChunkSize
+		if _, err := outFile.WriteAt(pt, offset); err != nil {
+			return false
+		}
+		setBit(recvBitmap, int(seq))
+		receivedCount++
+		receivedBytes += int64(len(pt))
+		return true
+	}
 
-	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		fmt.Printf("DataChannel %q opened\n", dc.Label())
-		recvDC = dc
-		var lastReport time.Time
-		var lastReceivedBytes int64
-		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			if msg.IsString {
-				var hdr struct {
-					Type       string `json:"type"`
-					Name       string `json:"name"`
-					Size       int64  `json:"size"`
-					ChunkSize  int    `json:"chunkSize"`
-					PrefixHash string `json:"prefixHash"`
-				}
-				_ = json.Unmarshal(msg.Data, &hdr)
-				switch hdr.Type {
-				case "meta":
-					mu.Lock()
-					meta.Name = hdr.Name
-					meta.Size = hdr.Size
-					meta.ChunkSize = hdr.ChunkSize
-					gotMeta = true
-					hasher = sha256.New()
-					partPath := meta.Name + ".part"
-					var resumeOffset int64
+	finishIfComplete := func() {
+		if finished || !gotMeta || outFile == nil {
+			return
+		}
+		if receivedCount < metaChunks {
+			return
+		}
+		finished = true
+		_ = outFile.Sync()
+		_ = outFile.Close()
+		outFile = nil
 
-					// Look for an existing partial file with matching prefix hash.
-					if st, err := os.Stat(partPath); err == nil && st.Size() <= meta.Size {
-						f, ferr := os.Open(partPath)
-						if ferr == nil {
-							prefixSize := int64(4096)
-							if st.Size() < prefixSize {
-								prefixSize = st.Size()
-							}
-							pbuf := make([]byte, prefixSize)
-							n, _ := io.ReadFull(f, pbuf)
-							_ = f.Close()
-							if hdr.PrefixHash != "" {
-								sum := sha256.Sum256(pbuf[:n])
-								if hex.EncodeToString(sum[:]) == hdr.PrefixHash {
-									resumeOffset = st.Size()
-									fmt.Printf("Found %q (%s/%s already received) — resuming\n",
-										partPath, formatBytes(resumeOffset), formatBytes(meta.Size))
-									// Hash the existing prefix so the final digest covers the whole file.
-									ph, herr := os.Open(partPath)
-									if herr == nil {
-										fmt.Printf("Hashing existing %s...\n", formatBytes(resumeOffset))
-										if _, herr := io.CopyN(hasher, ph, resumeOffset); herr != nil {
-											fmt.Fprintf(os.Stderr, "warn: prefix hash failed: %v (full checksum will be off)\n", herr)
-										}
-										ph.Close()
-									}
-								} else {
-									fmt.Printf("Found %q but prefix differs — discarding and starting fresh\n", partPath)
-									_ = os.Remove(partPath)
-								}
-							}
-						}
-					}
-
-					var f *os.File
-					var ferr error
-					if resumeOffset > 0 {
-						f, ferr = os.OpenFile(partPath, os.O_WRONLY, 0644)
-						if ferr == nil {
-							_, ferr = f.Seek(resumeOffset, 0)
-						}
-					} else {
-						f, ferr = os.Create(partPath)
-					}
-					if ferr != nil {
-						transferDone <- ferr
-						mu.Unlock()
-						return
-					}
-					outFile = f
-					received = resumeOffset
-					startT = time.Now()
-					lastReport = startT
-					lastReceivedBytes = resumeOffset
-					mu.Unlock()
-					if resumeOffset == 0 {
-						fmt.Printf("Receiving %q (%s)\n", meta.Name, formatBytes(meta.Size))
-					}
-
-					// Tell sender where to resume from
-					ready, _ := json.Marshal(map[string]any{"type": "ready", "offset": resumeOffset})
-					_ = dc.SendText(string(ready))
-				case "done":
-					var doneHdr struct {
-						FileHash string `json:"fileHash"`
-					}
-					_ = json.Unmarshal(msg.Data, &doneHdr)
-
-					mu.Lock()
-					if outFile != nil {
-						_ = outFile.Sync()
-						_ = outFile.Close()
-						outFile = nil
-					}
-
-					partPath := meta.Name + ".part"
-					var got string
-					if hasher != nil {
-						got = hex.EncodeToString(hasher.Sum(nil))
-					}
-					if doneHdr.FileHash != "" && got != "" && got != doneHdr.FileHash {
-						fmt.Fprintf(os.Stderr, "\nERROR: SHA-256 mismatch (expected %s, got %s). %q kept for inspection.\n",
-							doneHdr.FileHash[:12]+"...", got[:12]+"...", partPath)
-						mu.Unlock()
-						transferDone <- fmt.Errorf("checksum mismatch — partial file left at %s", partPath)
-						return
-					}
-					// Promote .part → final filename
-					if _, err := os.Stat(partPath); err == nil {
-						_ = os.Remove(meta.Name) // overwrite if exists
-						if err := os.Rename(partPath, meta.Name); err != nil {
-							fmt.Fprintf(os.Stderr, "warn: rename %s -> %s: %v\n", partPath, meta.Name, err)
-						}
-					}
-					elapsed := time.Since(startT)
-					rate := float64(received) / elapsed.Seconds() / 1024 / 1024
-					verifyMsg := ""
-					if doneHdr.FileHash != "" && got == doneHdr.FileHash {
-						verifyMsg = " (SHA-256 verified)"
-					}
-					fmt.Printf("\rDone: %s in %s (%.1f MB/s)%s                     \n",
-						formatBytes(received), elapsed.Round(time.Millisecond), rate, verifyMsg)
-					transferOK = true
-					mu.Unlock()
-					// ACK so the sender can safely tear down the WebSocket.
-					ack, _ := json.Marshal(map[string]any{"type": "complete"})
-					_ = dc.SendText(string(ack))
-					transferDone <- nil
-				}
-				return
-			}
-			// Binary chunk: [4-byte seq][payload]
-			if len(msg.Data) < 4 {
-				return
-			}
-			payload := msg.Data[4:]
-			mu.Lock()
-			if outFile != nil {
-				if _, err := outFile.Write(payload); err != nil {
-					transferDone <- err
-					mu.Unlock()
-					return
-				}
-				if hasher != nil {
-					hasher.Write(payload)
-				}
-				received += int64(len(payload))
-			}
-			now := time.Now()
-			if now.Sub(lastReport) > 500*time.Millisecond && gotMeta {
-				dt := now.Sub(lastReport).Seconds()
-				rate := float64(received-lastReceivedBytes) / dt / 1024 / 1024
-				pct := float64(received) / float64(meta.Size) * 100
-				fmt.Printf("\r  %s %5.1f%%  %s/%s  %.1f MB/s   ",
-					progressBar(pct, 30), pct, formatBytes(received), formatBytes(meta.Size), rate)
-				lastReport = now
-				lastReceivedBytes = received
-			}
-			mu.Unlock()
-		})
-		dc.OnClose(func() {
-			// If the DC closed before "done" arrived, that is the real
-			// disconnect signal; report it so the main loop unblocks.
-			mu.Lock()
-			if !transferOK {
+		partPath := metaName + ".part"
+		verifyMsg := ""
+		if expectedHash != "" {
+			fmt.Printf("\nVerifying SHA-256...\n")
+			got, herr := hashFileFull(partPath)
+			if herr != nil {
+				fmt.Fprintf(os.Stderr, "warn: hash %s: %v\n", partPath, herr)
+			} else if got != expectedHash {
 				select {
-				case transferDone <- fmt.Errorf("data channel closed mid-transfer"):
+				case transferDone <- fmt.Errorf("checksum mismatch: expected %s, got %s — partial kept at %s",
+					shortHash(expectedHash), shortHash(got), partPath):
 				default:
 				}
+				return
+			} else {
+				verifyMsg = " (SHA-256 verified)"
 			}
-			mu.Unlock()
-		})
-	})
-	_ = recvDC
+		}
 
-	myPeerID := ""
+		_ = os.Remove(metaName)
+		if err := os.Rename(partPath, metaName); err != nil {
+			fmt.Fprintf(os.Stderr, "warn: rename %s -> %s: %v\n", partPath, metaName, err)
+		}
+		elapsed := time.Since(startT)
+		rate := float64(metaSize) / elapsed.Seconds() / 1024 / 1024
+		fmt.Printf("\rDone: %s in %s (%.1f MB/s, E2E decrypted)%s                       \n",
+			formatBytes(metaSize), elapsed.Round(time.Millisecond), rate, verifyMsg)
+		if dc, ok := controlDC.Load().(*webrtc.DataChannel); ok && dc != nil {
+			ack, _ := json.Marshal(map[string]any{"type": "complete"})
+			_ = dc.SendText(string(ack))
+		}
+		select {
+		case transferDone <- nil:
+		default:
+		}
+	}
+
+	// On meta arrival, look for a matching .part to resume from. If the
+	// first 4KB hash matches, populate recvBitmap and offset the file
+	// pointer so already-have chunks aren't re-written.
+	scanResume := func(prefixHash string) (alreadyHave int, bm []byte) {
+		if prefixHash == "" {
+			return 0, nil
+		}
+		partPath := metaName + ".part"
+		st, err := os.Stat(partPath)
+		if err != nil || st.Size() == 0 || st.Size() > metaSize {
+			return 0, nil
+		}
+		f, err := os.Open(partPath)
+		if err != nil {
+			return 0, nil
+		}
+		defer f.Close()
+		hashBuf := make([]byte, prefixHashSize)
+		n, _ := io.ReadFull(f, hashBuf)
+		got := sha256.Sum256(hashBuf[:n])
+		if hex.EncodeToString(got[:]) != prefixHash {
+			return 0, nil
+		}
+		// Prefix matches. Assume contiguous chunks 0..K-1 are valid where
+		// K = floor(partSize / chunkSize). The trailing partial chunk (if
+		// any) is discarded — it's safer to re-receive than to half-trust.
+		fullChunks := int(st.Size() / metaChunkSize)
+		if fullChunks > metaChunks {
+			fullChunks = metaChunks
+		}
+		bm = newBitmap(metaChunks)
+		for i := 0; i < fullChunks; i++ {
+			setBit(bm, i)
+		}
+		return fullChunks, bm
+	}
+
+	onControlMessage := func(msg webrtc.DataChannelMessage) {
+		if !msg.IsString {
+			return
+		}
+		var m struct {
+			Type            string `json:"type"`
+			Name            string `json:"name"`
+			Size            int64  `json:"size"`
+			Mime            string `json:"mime"`
+			ChunkSize       int64  `json:"chunkSize"`
+			TotalChunks     int    `json:"totalChunks"`
+			ProtocolVersion int    `json:"protocolVersion"`
+			Reason          string `json:"reason"`
+			PrefixHash      string `json:"prefixHash"`
+			FileHash        string `json:"fileHash"`
+		}
+		if err := json.Unmarshal(msg.Data, &m); err != nil {
+			return
+		}
+		switch m.Type {
+		case "meta":
+			stMu.Lock()
+			defer stMu.Unlock()
+			if gotMeta {
+				return
+			}
+			metaName = m.Name
+			metaSize = m.Size
+			metaChunkSize = m.ChunkSize
+			if metaChunkSize == 0 {
+				metaChunkSize = chunkSize
+			}
+			metaChunks = m.TotalChunks
+			if metaChunks == 0 {
+				if metaChunkSize > 0 {
+					metaChunks = int((metaSize + metaChunkSize - 1) / metaChunkSize)
+				}
+				if metaChunks == 0 {
+					metaChunks = 1
+				}
+			}
+			metaFileHash = m.PrefixHash
+			_ = metaFileHash // silence unused (we stash prefix hash separately below)
+
+			alreadyHave, resumeBm := scanResume(m.PrefixHash)
+			partPath := metaName + ".part"
+			var f *os.File
+			var ferr error
+			if alreadyHave > 0 {
+				f, ferr = os.OpenFile(partPath, os.O_RDWR, 0644)
+			} else {
+				_ = os.Remove(partPath) // start fresh
+				f, ferr = os.Create(partPath)
+			}
+			if ferr != nil {
+				select {
+				case transferDone <- ferr:
+				default:
+				}
+				return
+			}
+			outFile = f
+			recvBitmap = resumeBm
+			if recvBitmap == nil {
+				recvBitmap = newBitmap(metaChunks)
+			}
+			receivedCount = alreadyHave
+			receivedBytes = int64(alreadyHave) * metaChunkSize
+			if receivedBytes > metaSize {
+				receivedBytes = metaSize
+			}
+			expectedHash = ""
+			startT = time.Now()
+			lastReport = startT
+			gotMeta = true
+
+			if alreadyHave > 0 {
+				fmt.Printf("Resuming %q (%d/%d chunks already on disk)\n", metaName, alreadyHave, metaChunks)
+			} else {
+				fmt.Printf("Receiving %q (%s, %d chunks, v%d)\n", metaName, formatBytes(metaSize), metaChunks, m.ProtocolVersion)
+			}
+
+			// Send "resume" with our current bitmap so the sender can skip
+			// already-have seqs in Phase 1. Always send (even when fresh,
+			// empty bitmap) so the sender doesn't have to wait the full
+			// resume-wait timeout.
+			if dc, ok := controlDC.Load().(*webrtc.DataChannel); ok && dc != nil {
+				resume, _ := json.Marshal(map[string]any{
+					"type": "resume",
+					"data": b64URL.EncodeToString(recvBitmap),
+				})
+				_ = dc.SendText(string(resume))
+			}
+
+			for _, p := range pending {
+				storeChunk(p.seq, p.pt)
+			}
+			pending = nil
+			finishIfComplete()
+		case "done":
+			stMu.Lock()
+			if !finished {
+				expectedHash = m.FileHash
+			}
+			finishIfComplete()
+			stMu.Unlock()
+		case "abort":
+			select {
+			case transferDone <- fmt.Errorf("sender aborted: %s", m.Reason):
+			default:
+			}
+		}
+	}
+
+	onDataMessage := func(msg webrtc.DataChannelMessage) {
+		if msg.IsString {
+			onControlMessage(msg)
+			return
+		}
+		if len(msg.Data) < seqHeaderBytes {
+			return
+		}
+		seq := binary.BigEndian.Uint32(msg.Data[:seqHeaderBytes])
+		ct := msg.Data[seqHeaderBytes:]
+		pt, err := decryptChunk(aead, ct, seq)
+		if err != nil {
+			return
+		}
+		stMu.Lock()
+		defer stMu.Unlock()
+		if !gotMeta {
+			pending = append(pending, pendingChunk{seq: seq, pt: pt})
+			return
+		}
+		if !storeChunk(seq, pt) {
+			return
+		}
+		now := time.Now()
+		if now.Sub(lastReport) > 500*time.Millisecond {
+			dt := now.Sub(lastReport).Seconds()
+			rate := float64(receivedBytes-lastReceived) / dt / 1024 / 1024
+			pct := float64(receivedBytes) / float64(metaSize) * 100
+			if metaSize == 0 {
+				pct = 100
+			}
+			fmt.Printf("\r  %s %5.1f%%  %s/%s  %.1f MB/s   ",
+				progressBar(pct, 30), pct, formatBytes(receivedBytes), formatBytes(metaSize), rate)
+			lastReport = now
+			lastReceived = receivedBytes
+		}
+		finishIfComplete()
+	}
+
+	getOrCreatePc := func(idx int) (*webrtc.PeerConnection, error) {
+		pcsMu.Lock()
+		defer pcsMu.Unlock()
+		if pcs[idx] != nil {
+			return pcs[idx], nil
+		}
+		pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: iceServers})
+		if err != nil {
+			return nil, err
+		}
+		pcs[idx] = pc
+		pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+			if c == nil {
+				return
+			}
+			rid, _ := remotePeerID.Load().(string)
+			if rid == "" {
+				return
+			}
+			ci := c.ToJSON()
+			_ = ws.write(sigMsg{Type: "ice", To: rid, Candidate: &ci, PcIdx: ptr(idx)})
+		})
+		pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+			label := dc.Label()
+			if label == "control" {
+				controlDC.Store(dc)
+				dc.OnMessage(onControlMessage)
+			} else {
+				dc.OnMessage(onDataMessage)
+			}
+		})
+		return pc, nil
+	}
+
+	// Bitmap reporter — every 200ms send current bitmap on the control DC.
+	go func() {
+		ticker := time.NewTicker(bitmapInterval)
+		defer ticker.Stop()
+		var version int64
+		for range ticker.C {
+			stMu.Lock()
+			if finished {
+				stMu.Unlock()
+				return
+			}
+			if recvBitmap == nil {
+				stMu.Unlock()
+				continue
+			}
+			version++
+			payload, _ := json.Marshal(map[string]any{
+				"type":     "bitmap",
+				"version":  version,
+				"received": receivedCount,
+				"data":     b64URL.EncodeToString(recvBitmap),
+			})
+			stMu.Unlock()
+			if dc, ok := controlDC.Load().(*webrtc.DataChannel); ok && dc != nil {
+				_ = dc.SendText(string(payload))
+			}
+		}
+	}()
+
 	go func() {
 		for {
 			var msg sigMsg
-			if err := ws.ReadJSON(&msg); err != nil {
+			if err := wsConn.ReadJSON(&msg); err != nil {
 				return
+			}
+			idx := 0
+			if msg.PcIdx != nil {
+				idx = *msg.PcIdx
+			}
+			if idx < 0 || idx >= numPCs {
+				idx = 0
 			}
 			switch msg.Type {
 			case "joined":
-				myPeerID = msg.PeerID
 			case "offer":
-				remotePeerID = msg.From
-				if msg.SDP != nil {
-					if err := pc.SetRemoteDescription(*msg.SDP); err != nil {
-						transferDone <- err
-						return
+				remotePeerID.Store(msg.From)
+				pc, err := getOrCreatePc(idx)
+				if err != nil {
+					select {
+					case transferDone <- err:
+					default:
 					}
-					ans, err := pc.CreateAnswer(nil)
-					if err != nil {
-						transferDone <- err
-						return
-					}
-					if err := pc.SetLocalDescription(ans); err != nil {
-						transferDone <- err
-						return
-					}
-					_ = ws.WriteJSON(sigMsg{Type: "answer", To: remotePeerID, SDP: &ans})
+					return
 				}
+				if msg.SDP == nil {
+					continue
+				}
+				if err := pc.SetRemoteDescription(*msg.SDP); err != nil {
+					select {
+					case transferDone <- err:
+					default:
+					}
+					return
+				}
+				ans, err := pc.CreateAnswer(nil)
+				if err != nil {
+					select {
+					case transferDone <- err:
+					default:
+					}
+					return
+				}
+				if err := pc.SetLocalDescription(ans); err != nil {
+					select {
+					case transferDone <- err:
+					default:
+					}
+					return
+				}
+				rid, _ := remotePeerID.Load().(string)
+				_ = ws.write(sigMsg{Type: "answer", To: rid, SDP: &ans, PcIdx: ptr(idx)})
 			case "ice":
-				if msg.Candidate != nil {
+				pcsMu.Lock()
+				pc := pcs[idx]
+				pcsMu.Unlock()
+				if pc != nil && msg.Candidate != nil {
 					_ = pc.AddICECandidate(*msg.Candidate)
 				}
 			case "peer-left":
-				// The signaling channel can drop before the final DC chunks
-				// land; rely on dc.OnClose / explicit "done" instead of
-				// killing the transfer here.
-				mu.Lock()
-				if !transferOK && received < meta.Size {
-					// We may still receive remaining buffered DC data —
-					// give the data channel up to 30s to deliver before
-					// declaring failure.
-					go func() {
-						deadline := time.Now().Add(30 * time.Second)
-						for time.Now().Before(deadline) {
-							time.Sleep(500 * time.Millisecond)
-							mu.Lock()
-							ok := transferOK
-							mu.Unlock()
-							if ok {
-								return
-							}
-						}
-						mu.Lock()
-						stillIncomplete := !transferOK
-						mu.Unlock()
-						if stillIncomplete {
-							select {
-							case transferDone <- fmt.Errorf("sender disconnected before transfer completed"):
-							default:
-							}
-						}
-					}()
+				stMu.Lock()
+				done := finished
+				stMu.Unlock()
+				if done {
+					return
 				}
-				mu.Unlock()
+				go func() {
+					deadline := time.Now().Add(30 * time.Second)
+					for time.Now().Before(deadline) {
+						time.Sleep(500 * time.Millisecond)
+						stMu.Lock()
+						isDone := finished
+						stMu.Unlock()
+						if isDone {
+							return
+						}
+					}
+					stMu.Lock()
+					stillIncomplete := !finished
+					stMu.Unlock()
+					if stillIncomplete {
+						select {
+						case transferDone <- fmt.Errorf("sender disconnected before transfer completed"):
+						default:
+						}
+					}
+				}()
 			case "error":
-				transferDone <- fmt.Errorf("signaling error: %s", msg.Reason)
+				select {
+				case transferDone <- fmt.Errorf("signaling error: %s", msg.Reason):
+				default:
+				}
 				return
 			}
 		}
 	}()
-	_ = myPeerID
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
@@ -849,16 +1426,17 @@ func runRecv(args []string) {
 	}
 }
 
+func shortHash(h string) string {
+	if len(h) <= 12 {
+		return h
+	}
+	return h[:12] + "..."
+}
+
 // ============================================================================
-// Helpers
+// Self-update + helpers
 // ============================================================================
 
-func ptr[T any](v T) *T { return &v }
-
-// checkForUpdate hits GitHub's /releases/latest, compares the tag with
-// our embedded Version, and prints a one-line nudge if a newer version
-// exists. Caches the latest tag in a small temp file for 6h to avoid
-// hammering the API on repeated invocations.
 func checkForUpdate() {
 	if os.Getenv("BEAMDROP_NO_UPDATE_CHECK") == "1" {
 		return
@@ -868,14 +1446,12 @@ func checkForUpdate() {
 	cacheFile := filepath.Join(cacheDir, "latest-tag")
 
 	var latest string
-	// Try cache first
 	if info, err := os.Stat(cacheFile); err == nil && time.Since(info.ModTime()) < 6*time.Hour {
 		if b, err := os.ReadFile(cacheFile); err == nil {
 			latest = strings.TrimSpace(string(b))
 		}
 	}
 
-	// Fall back to GitHub API
 	if latest == "" {
 		client := &http.Client{Timeout: 2 * time.Second}
 		resp, err := client.Get("https://api.github.com/repos/s-saga011/beamdrop-cli/releases/latest")
@@ -905,9 +1481,6 @@ func checkForUpdate() {
 	fmt.Fprintln(os.Stderr)
 }
 
-// runUpdate self-replaces the running binary with the latest release.
-// On Windows we rename the in-use .exe out of the way and drop the new one
-// in place; the .old copy is cleaned up on the next launch.
 func runUpdate() {
 	exePath, err := os.Executable()
 	if err != nil {
@@ -1004,15 +1577,12 @@ func downloadTo(url, dest string) error {
 
 func atomicReplaceBinary(target, source string) error {
 	if runtime.GOOS == "windows" {
-		// Windows refuses to overwrite a running .exe. Renames are allowed,
-		// so move the running one aside, then move the new one into place.
 		oldFile := target + ".old"
 		_ = os.Remove(oldFile)
 		if err := os.Rename(target, oldFile); err != nil {
 			return fmt.Errorf("rename old: %w", err)
 		}
 		if err := os.Rename(source, target); err != nil {
-			// best effort: put the original back
 			_ = os.Rename(oldFile, target)
 			return fmt.Errorf("rename new: %w", err)
 		}
@@ -1024,8 +1594,6 @@ func atomicReplaceBinary(target, source string) error {
 	return os.Rename(source, target)
 }
 
-// cleanupStaleBinary removes any leftover ".old" alongside our binary
-// (created by a previous Windows-style self-update).
 func cleanupStaleBinary() {
 	exePath, err := os.Executable()
 	if err != nil {
@@ -1037,8 +1605,6 @@ func cleanupStaleBinary() {
 	_ = os.Remove(exePath + ".old")
 }
 
-// versionLess reports whether a < b for vMAJOR.MINOR.PATCH-style strings.
-// Unparsable components fall through to string comparison.
 func versionLess(a, b string) bool {
 	aa := strings.Split(strings.TrimPrefix(a, "v"), ".")
 	bb := strings.Split(strings.TrimPrefix(b, "v"), ".")
@@ -1065,32 +1631,28 @@ func versionLess(a, b string) bool {
 const installSh = "https://raw.githubusercontent.com/s-saga011/beamdrop-cli/main/install.sh"
 const installPs1 = "https://raw.githubusercontent.com/s-saga011/beamdrop-cli/main/install.ps1"
 
-// printShareInstructions emits a copy-pasteable, install-or-reuse one-liner
-// for each platform, plus an ASCII QR for phone scanning.
 func printShareInstructions(room, shareURL string) {
 	fmt.Println()
 	fmt.Println("┌─ Share with the recipient ──────────────────────────────────────")
 	fmt.Println("│")
-	fmt.Println("│  macOS / Linux (auto-installs CLI if missing):")
-	fmt.Printf("│    curl -fsSL %s | sh -s -- recv %s\n", installSh, room)
+	fmt.Println("│  Full URL (works in any browser, includes E2E key):")
+	fmt.Printf("│    %s\n", shareURL)
 	fmt.Println("│")
-	fmt.Println("│  Windows PowerShell (auto-installs CLI if missing):")
-	fmt.Printf("│    & ([scriptblock]::Create((irm %s))) recv %s\n", installPs1, room)
+	fmt.Println("│  macOS / Linux CLI (auto-installs if missing):")
+	fmt.Printf("│    curl -fsSL %s | sh -s -- recv '%s'\n", installSh, shareURL)
+	fmt.Println("│")
+	fmt.Println("│  Windows PowerShell CLI (auto-installs if missing):")
+	fmt.Printf("│    & ([scriptblock]::Create((irm %s))) recv '%s'\n", installPs1, shareURL)
 	fmt.Println("│")
 	fmt.Println("│  Already installed — update first, then receive:")
-	fmt.Printf("│    beamdrop update && beamdrop recv %s        (bash / zsh / PowerShell 7+)\n", room)
-	fmt.Printf("│    beamdrop update; beamdrop recv %s          (PowerShell 5 / cmd.exe)\n", room)
-	fmt.Println("│")
-	fmt.Printf("│  Share URL: %s\n", shareURL)
+	fmt.Printf("│    beamdrop update && beamdrop recv '%s'\n", shareURL)
 	fmt.Println("└──────────────────────────────────────────────────────────────────")
 	fmt.Println()
-	// QR code for scanning the share URL
 	qrterminal.GenerateHalfBlock(shareURL, qrterminal.L, os.Stdout)
 	fmt.Println()
+	_ = room
 }
 
-// progressBar returns an inline ASCII/Unicode progress bar like
-// "[████████████░░░░░░] 60.0%". width is the number of cells.
 func progressBar(pct float64, width int) string {
 	if pct < 0 {
 		pct = 0
