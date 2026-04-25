@@ -38,7 +38,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.1.2" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.1.6"
+var Version = "v0.1.7"
 
 const (
 	chunkSize     = 256 * 1024
@@ -150,11 +150,14 @@ func main() {
 	if len(os.Args) < 2 {
 		usage()
 	}
+	cleanupStaleBinary()
 	switch os.Args[1] {
 	case "send":
 		runSend(os.Args[2:])
 	case "recv":
 		runRecv(os.Args[2:])
+	case "update":
+		runUpdate()
 	case "--version", "-v", "version":
 		fmt.Println(Version)
 		return
@@ -171,8 +174,10 @@ func usage() {
 
 Usage:
   beamdrop send <file> [--server URL]
-  beamdrop recv <url>            # share URL printed by 'send'
+  beamdrop recv <url>             # share URL printed by 'send'
   beamdrop recv <room> [--server URL]
+  beamdrop update                 # download the latest release in place
+  beamdrop --version              # print current version
 
 Defaults:
   --server  https://p2p.draft-publish.com
@@ -895,14 +900,141 @@ func checkForUpdate() {
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "[beamdrop] update available: %s → %s\n", Version, latest)
-	if runtime.GOOS == "windows" {
-		fmt.Fprintln(os.Stderr, "  irm https://raw.githubusercontent.com/s-saga011/beamdrop-cli/main/install.ps1 | iex")
-	} else {
-		fmt.Fprintln(os.Stderr, "  curl -fsSL https://raw.githubusercontent.com/s-saga011/beamdrop-cli/main/install.sh | sh")
-	}
+	fmt.Fprintf(os.Stderr, "[beamdrop] update available: %s → %s — run: beamdrop update\n", Version, latest)
 	fmt.Fprintln(os.Stderr, "  (set BEAMDROP_NO_UPDATE_CHECK=1 to silence)")
 	fmt.Fprintln(os.Stderr)
+}
+
+// runUpdate self-replaces the running binary with the latest release.
+// On Windows we rename the in-use .exe out of the way and drop the new one
+// in place; the .old copy is cleaned up on the next launch.
+func runUpdate() {
+	exePath, err := os.Executable()
+	if err != nil {
+		die(fmt.Errorf("locate self: %w", err))
+	}
+	if resolved, rerr := filepath.EvalSymlinks(exePath); rerr == nil {
+		exePath = resolved
+	}
+	fmt.Printf("Current: %s (%s)\n", exePath, Version)
+
+	fmt.Println("Checking GitHub for the latest release...")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get("https://api.github.com/repos/s-saga011/beamdrop-cli/releases/latest")
+	if err != nil {
+		die(fmt.Errorf("github api: %w", err))
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		die(fmt.Errorf("github api status %d", resp.StatusCode))
+	}
+	var rel struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		die(fmt.Errorf("decode release: %w", err))
+	}
+	latest := rel.TagName
+	if latest == "" {
+		die(fmt.Errorf("github did not return a tag_name"))
+	}
+
+	if !versionLess(Version, latest) {
+		fmt.Printf("Already at %s (latest is %s).\n", Version, latest)
+		return
+	}
+
+	osName := runtime.GOOS
+	arch := runtime.GOARCH
+	ext := ""
+	if osName == "windows" {
+		ext = ".exe"
+	}
+	asset := fmt.Sprintf("beamdrop-%s-%s%s", osName, arch, ext)
+	url := fmt.Sprintf("https://github.com/s-saga011/beamdrop-cli/releases/download/%s/%s", latest, asset)
+
+	fmt.Printf("Downloading %s (%s)...\n", asset, latest)
+	tmpFile := exePath + ".new"
+	_ = os.Remove(tmpFile)
+
+	var dlErr error
+	for attempt := 1; attempt <= 5; attempt++ {
+		if attempt > 1 {
+			time.Sleep(2 * time.Second)
+			fmt.Printf("  retry %d/5...\n", attempt)
+		}
+		dlErr = downloadTo(url, tmpFile)
+		if dlErr == nil {
+			break
+		}
+	}
+	if dlErr != nil {
+		_ = os.Remove(tmpFile)
+		die(fmt.Errorf("download failed after 5 attempts: %w", dlErr))
+	}
+
+	if err := atomicReplaceBinary(exePath, tmpFile); err != nil {
+		_ = os.Remove(tmpFile)
+		die(fmt.Errorf("install: %w", err))
+	}
+
+	fmt.Printf("Updated %s → %s\n", Version, latest)
+}
+
+func downloadTo(url, dest string) error {
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	f, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func atomicReplaceBinary(target, source string) error {
+	if runtime.GOOS == "windows" {
+		// Windows refuses to overwrite a running .exe. Renames are allowed,
+		// so move the running one aside, then move the new one into place.
+		oldFile := target + ".old"
+		_ = os.Remove(oldFile)
+		if err := os.Rename(target, oldFile); err != nil {
+			return fmt.Errorf("rename old: %w", err)
+		}
+		if err := os.Rename(source, target); err != nil {
+			// best effort: put the original back
+			_ = os.Rename(oldFile, target)
+			return fmt.Errorf("rename new: %w", err)
+		}
+		return nil
+	}
+	if err := os.Chmod(source, 0755); err != nil {
+		return err
+	}
+	return os.Rename(source, target)
+}
+
+// cleanupStaleBinary removes any leftover ".old" alongside our binary
+// (created by a previous Windows-style self-update).
+func cleanupStaleBinary() {
+	exePath, err := os.Executable()
+	if err != nil {
+		return
+	}
+	if resolved, rerr := filepath.EvalSymlinks(exePath); rerr == nil {
+		exePath = resolved
+	}
+	_ = os.Remove(exePath + ".old")
 }
 
 // versionLess reports whether a < b for vMAJOR.MINOR.PATCH-style strings.
