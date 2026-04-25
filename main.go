@@ -38,7 +38,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.1.2" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.1.7"
+var Version = "v0.1.8"
 
 const (
 	chunkSize     = 256 * 1024
@@ -1077,8 +1077,9 @@ func printShareInstructions(room, shareURL string) {
 	fmt.Println("│  Windows PowerShell (auto-installs CLI if missing):")
 	fmt.Printf("│    & ([scriptblock]::Create((irm %s))) recv %s\n", installPs1, room)
 	fmt.Println("│")
-	fmt.Println("│  Already installed:")
-	fmt.Printf("│    beamdrop recv %s\n", room)
+	fmt.Println("│  Already installed — update first, then receive:")
+	fmt.Printf("│    beamdrop update && beamdrop recv %s        (bash / zsh / PowerShell 7+)\n", room)
+	fmt.Printf("│    beamdrop update; beamdrop recv %s          (PowerShell 5 / cmd.exe)\n", room)
 	fmt.Println("│")
 	fmt.Printf("│  Share URL: %s\n", shareURL)
 	fmt.Println("└──────────────────────────────────────────────────────────────────")
