@@ -60,7 +60,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.2.1"
+var Version = "v0.2.2"
 
 const (
 	chunkSize           = 16 * 1024
@@ -70,9 +70,11 @@ const (
 	seqHeaderBytes      = 4
 	ivLength            = 12
 	prefixHashSize      = 4096
-	bitmapInterval      = 200 * time.Millisecond
-	retransmitInterval  = 250 * time.Millisecond
-	maxRetransmitPasses = 10
+	bitmapInterval        = 200 * time.Millisecond
+	retransmitInterval    = 250 * time.Millisecond
+	maxRetransmitPasses   = 60
+	retransmitBatchLimit  = 2000 // chunks per pass — keep small so receiver can drain between passes
+	stagnantPassThreshold = 12   // ~3s of "no progress" passes before bailing
 	resumeWaitTimeout   = 1500 * time.Millisecond
 	protocolVersion     = 3
 	defaultServer       = "https://p2p.draft-publish.com"
@@ -812,13 +814,43 @@ func runSend(args []string) {
 		}
 		lastReportMu.Unlock()
 		if shouldReport {
-			rate := float64(pushed-lastP) / dt / 1024 / 1024
-			pct := float64(pushed) / float64(totalBytes) * 100
-			if totalBytes == 0 {
-				pct = 100
+			// True receiver-side progress comes from the receiver's bitmap;
+			// bytesPushed counts every send including retransmits and can
+			// run well past totalBytes during Phase 2.
+			recvBitmapMu.Lock()
+			rb := recvBitmap
+			recvBitmapMu.Unlock()
+			var ackedBytes int64
+			var pct float64
+			if rb != nil {
+				acked := int64(countSetBits(rb))
+				ackedBytes = acked * chunkSize
+				if ackedBytes > totalBytes {
+					ackedBytes = totalBytes
+				}
+				if totalBytes > 0 {
+					pct = float64(ackedBytes) / float64(totalBytes) * 100
+				} else {
+					pct = 100
+				}
+			} else {
+				ackedBytes = pushed
+				if ackedBytes > totalBytes {
+					ackedBytes = totalBytes
+				}
+				if totalBytes > 0 {
+					pct = float64(ackedBytes) / float64(totalBytes) * 100
+				} else {
+					pct = 100
+				}
 			}
-			fmt.Printf("\r  %s %5.1f%%  %s/%s  %.1f MB/s   ",
-				progressBar(pct, 30), pct, formatBytes(pushed), formatBytes(totalBytes), rate)
+			rate := float64(pushed-lastP) / dt / 1024 / 1024
+			extra := ""
+			if pushed > totalBytes {
+				extra = fmt.Sprintf("  pushed %s", formatBytes(pushed))
+			}
+			fmt.Printf("\r  %s %5.1f%%  %s/%s  %.1f MB/s%s   ",
+				progressBar(pct, 30), pct, formatBytes(ackedBytes), formatBytes(totalBytes), rate, extra)
 		}
 		return nil
 	}
@@ -937,8 +969,23 @@ func runSend(args []string) {
 	doneJSON, _ := json.Marshal(doneMsg)
 	_ = controlDC.SendText(string(doneJSON))
 
-	// Phase 2: bitmap-driven retransmit. Random access via ReadAt.
+	// Phase 2: bitmap-driven retransmit.
+	//
+	// We retransmit in *small* batches (retransmitBatchLimit chunks per pass)
+	// so the receiver can drain its decrypt+store queue and refresh its
+	// bitmap between passes. Otherwise — observed in v0.2.0 — the sender
+	// floods the receiver with all "missing" chunks, the bitmap stays stale
+	// for seconds, and the next pass repeats almost the same set, ballooning
+	// total bytes pushed to many multiples of the file size.
+	//
+	// Pass termination rules:
+	//   - We give up after maxRetransmitPasses regardless.
+	//   - We also give up after stagnantPassThreshold consecutive passes
+	//     where the receiver's bitmap shows zero progress (so we don't
+	//     hammer a permanently-broken DC for minutes).
 	pass := 0
+	stagnant := 0
+	var prevReceivedBits int
 	for pass < maxRetransmitPasses && !transferComplete.Load() {
 		select {
 		case err := <-wsErr:
@@ -959,11 +1006,12 @@ func runSend(args []string) {
 		if bm == nil {
 			continue
 		}
+		curReceivedBits := countSetBits(bm)
 		var missing []uint32
 		for s := 0; s < expectedChunks; s++ {
 			if !getBit(bm, s) {
 				missing = append(missing, uint32(s))
-				if len(missing) >= 50000 {
+				if len(missing) >= retransmitBatchLimit {
 					break
 				}
 			}
@@ -971,8 +1019,22 @@ func runSend(args []string) {
 		if len(missing) == 0 {
 			continue
 		}
+		// Stagnation tracking: did the receiver's bitmap advance since the
+		// previous pass? If not for stagnantPassThreshold passes in a row,
+		// give up.
+		if curReceivedBits <= prevReceivedBits {
+			stagnant++
+			if stagnant >= stagnantPassThreshold {
+				ab, _ := json.Marshal(map[string]any{"type": "abort", "reason": "no receiver progress for too many retransmit passes"})
+				_ = controlDC.SendText(string(ab))
+				die(fmt.Errorf("retransmit stagnated: receiver bitmap unchanged for %d passes (still %d/%d chunks)", stagnant, curReceivedBits, expectedChunks))
+			}
+		} else {
+			stagnant = 0
+		}
+		prevReceivedBits = curReceivedBits
 		pass++
-		fmt.Printf("\n  retransmit pass %d: %d missing chunks\n", pass, len(missing))
+		fmt.Printf("\n  retransmit pass %d: %d missing (rcv has %d/%d)\n", pass, len(missing), curReceivedBits, expectedChunks)
 		f, err := os.Open(path)
 		if err != nil {
 			die(fmt.Errorf("reopen for retransmit: %w", err))
