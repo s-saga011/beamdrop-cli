@@ -60,7 +60,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.2.13"
+var Version = "v0.2.14"
 
 const (
 	chunkSize           = 16 * 1024
@@ -77,8 +77,7 @@ const (
 	retransmitBatchLimit  = 2000 // chunks per pass — keep small so receiver can drain between passes
 	retransmitBatchMin    = 200  // floor when we shrink the batch under loss
 	stagnantPassThreshold = 12   // ~3s of "no progress" passes before bailing
-	relayInflightWindow   = 1000 // chunks (16MB) — tight cap on relay (TCP/TLS) to keep TURN buffer bounded
-	defaultInflightWindow = 4000 // chunks (64MB) — looser cap on direct/UDP path; pion bufferedAmount-based throttle is the primary, this is the safety net
+	relayInflightWindow = 1000 // chunks (16MB) — relay-only cap, since pion bufferedAmount under-reports on TCP/TLS
 	resumeWaitTimeout   = 1500 * time.Millisecond
 	protocolVersion     = 3
 	defaultServer       = "https://p2p.draft-publish.com"
@@ -1045,23 +1044,21 @@ func runSend(args []string) {
 
 	sentBitmap := newBitmap(expectedChunks)
 	var sentMu sync.Mutex
-	// Bound how far the sender can run ahead of the receiver's bitmap.
-	// Browsers' RTCDataChannel.bufferedAmount accurately reflects the
-	// SCTP send queue, so JS senders self-throttle naturally. Pion v4's
-	// BufferedAmount() returns ~0 even when megabytes are queued in the
-	// TCP/TURN/recv-side path, so 4 workers can dump 504MB in seconds
-	// while the wire is at 200 KB/s — stuffing downstream buffers and
-	// triggering carrier congestion ('starts fast, dies fast' on cellular).
-	// Mirror what the browser does naturally with an explicit window:
-	//   relay mode (TLS:443 TCP):  1000 chunks (~16MB) — tight, since
-	//     downstream queues can balloon at TCP/TURN layers
-	//   direct/UDP mode:            4000 chunks (~64MB) — looser; pion's
-	//     SCTP-level bufferedAmount is the primary throttle here
-	inflightWindow := defaultInflightWindow
-	if fl.relay {
-		inflightWindow = relayInflightWindow
-	}
+	// In --relay (reliable+TCP/TLS) mode, pion's BufferedAmount() doesn't
+	// reflect the underlying TCP/TURN/recv-side queue depth, so the
+	// bufferedHigh-based throttle in sendChunk fires almost never and the
+	// 4 workers dump megabytes into downstream buffers in seconds (which
+	// then triggers carrier congestion, the 'starts fast, dies fast'
+	// cellular pattern). Bound it with a bitmap-derived window — same
+	// idea as TCP's send window. Only enable on relay; on direct UDP path
+	// the existing bufferedAmount throttle is sufficient (pion's SCTP-
+	// level bufferedAmount works for plain UDP) and bitmap-based capping
+	// would unnecessarily slow healthy WiFi/LAN by waiting on the
+	// receiver's per-chunk decode rate.
 	waitInflight := func(seq uint32) {
+		if !fl.relay {
+			return
+		}
 		for {
 			if transferComplete.Load() {
 				return
@@ -1073,7 +1070,7 @@ func runSend(args []string) {
 			if rb != nil {
 				ackedCount = countSetBits(rb)
 			}
-			if int(seq)-ackedCount < inflightWindow {
+			if int(seq)-ackedCount < relayInflightWindow {
 				return
 			}
 			select {
