@@ -60,7 +60,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.2.5"
+var Version = "v0.2.6"
 
 const (
 	chunkSize           = 16 * 1024
@@ -514,12 +514,33 @@ func runSend(args []string) {
 		die(err)
 	}
 
-	totalDCs := numPCs + 1
+	// retransmit DC: reliable + ordered (no MaxRetransmits / MaxPacketLifeTime).
+	// Phase 2 retransmits flow over this DC instead of round-robining across
+	// the four datagram-mode file-N DCs. On lossy links (mobile cellular
+	// observed at ~80% packet loss) datagram retransmits compound the loss
+	// and the bitmap-driven repeat-send blows up bandwidth use; letting SCTP
+	// retry on the wire converges far faster. Phase 1 stays on the file-N
+	// DCs for max throughput on healthy links.
+	retransmitDC, err := pcs[0].CreateDataChannel("retransmit", &webrtc.DataChannelInit{Ordered: ptr(true)})
+	if err != nil {
+		die(err)
+	}
+	retransmitDC.SetBufferedAmountLowThreshold(bufferedLow)
+	retransmitBufLow := make(chan struct{}, 1)
+	retransmitDC.OnBufferedAmountLow(func() {
+		select {
+		case retransmitBufLow <- struct{}{}:
+		default:
+		}
+	})
+
+	totalDCs := numPCs + 2 // 4 file-N + 1 control + 1 retransmit
 	openCh := make(chan struct{}, totalDCs)
 	for _, dc := range dataDCs {
 		dc.OnOpen(func() { openCh <- struct{}{} })
 	}
 	controlDC.OnOpen(func() { openCh <- struct{}{} })
+	retransmitDC.OnOpen(func() { openCh <- struct{}{} })
 
 	var (
 		recvBitmapMu  sync.Mutex
@@ -1034,13 +1055,13 @@ func runSend(args []string) {
 		}
 		prevReceivedBits = curReceivedBits
 		pass++
-		fmt.Printf("\n  retransmit pass %d: %d missing (rcv has %d/%d)\n",
+		fmt.Printf("\n  retransmit pass %d: %d missing (rcv has %d/%d, via reliable DC)\n",
 			pass, len(missing), curReceivedBits, expectedChunks)
 		f, err := os.Open(path)
 		if err != nil {
 			die(fmt.Errorf("reopen for retransmit: %w", err))
 		}
-		for i, s := range missing {
+		for _, s := range missing {
 			if transferComplete.Load() {
 				break
 			}
@@ -1057,16 +1078,19 @@ func runSend(args []string) {
 				f.Close()
 				die(fmt.Errorf("readat seq=%d: %w", s, err))
 			}
-			dc := dataDCs[i%numPCs]
-			ch := bufLow[i%numPCs]
-			if err := sendChunk(dc, ch, s, pt); err != nil {
+			// Send retransmits through the dedicated reliable DC. SCTP's
+			// own retransmit handles wire loss; we don't need to re-queue
+			// from this end, just push once and trust the lower layer.
+			if err := sendChunk(retransmitDC, retransmitBufLow, s, pt); err != nil {
 				break
 			}
 		}
 		f.Close()
 	}
 
-	// Drain remaining DC buffers so the wire delivery completes.
+	// Drain remaining DC buffers so the wire delivery completes. Include
+	// the retransmit DC — its reliable mode means lingering bytes are
+	// still being acked by SCTP and we want them to land before exit.
 	drainStart := time.Now()
 	for {
 		any := false
@@ -1075,6 +1099,9 @@ func runSend(args []string) {
 				any = true
 				break
 			}
+		}
+		if !any && retransmitDC.BufferedAmount() > 0 {
+			any = true
 		}
 		if !any || time.Since(drainStart) > 10*time.Second {
 			break
