@@ -60,7 +60,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.2.0"
+var Version = "v0.2.1"
 
 const (
 	chunkSize           = 16 * 1024
@@ -76,6 +76,8 @@ const (
 	resumeWaitTimeout   = 1500 * time.Millisecond
 	protocolVersion     = 3
 	defaultServer       = "https://p2p.draft-publish.com"
+	stallTimeout        = 30 * time.Second // abort send if bytesPushed doesn't move for this long
+	statsInterval       = 2 * time.Second  // sender->server stats cadence
 )
 
 // ============================================================================
@@ -319,6 +321,14 @@ func (s *safeWS) write(m sigMsg) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.conn.WriteJSON(m)
+}
+
+// writeRaw sends a pre-marshalled JSON payload (e.g. stats reports that
+// don't fit the sigMsg shape).
+func (s *safeWS) writeRaw(b []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn.WriteMessage(websocket.TextMessage, b)
 }
 
 // ============================================================================
@@ -676,6 +686,97 @@ func runSend(args []string) {
 	lastReport := sendStart
 	var lastPushed int64
 
+	// abortSig closes when the send is forcibly aborted (stall watchdog or
+	// explicit error). Goroutines waiting on DC drains, channel sends, etc.,
+	// must include this in their selects so they can unwind cleanly.
+	abortSig := make(chan struct{})
+	var abortOnce sync.Once
+	var abortReason atomic.Value
+	abort := func(reason string) {
+		abortOnce.Do(func() {
+			abortReason.Store(reason)
+			close(abortSig)
+		})
+	}
+
+	// Stall watchdog: if bytesPushed doesn't move for stallTimeout, give up.
+	// This catches the case where pion's SCTP buffer wedges (e.g. mobile
+	// receiver Wi-Fi went idle) so we don't hang the user's terminal forever.
+	go func() {
+		var last int64 = -1
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		stalledSince := time.Time{}
+		for {
+			select {
+			case <-abortSig:
+				return
+			case <-ticker.C:
+			}
+			if transferComplete.Load() {
+				return
+			}
+			cur := bytesPushed.Load()
+			if cur == last && cur > 0 {
+				if stalledSince.IsZero() {
+					stalledSince = time.Now()
+				} else if time.Since(stalledSince) >= stallTimeout {
+					abort(fmt.Sprintf("no progress for %s", stallTimeout))
+					return
+				}
+			} else {
+				stalledSince = time.Time{}
+			}
+			last = cur
+		}
+	}()
+
+	// Sender stats reporter: every statsInterval, push our perspective to the
+	// signaling server so it shows up in `journalctl -u beamdrop`. Mirrors
+	// what the browser sender already does.
+	go func() {
+		ticker := time.NewTicker(statsInterval)
+		defer ticker.Stop()
+		var lastBytes int64
+		lastTime := time.Now()
+		for {
+			select {
+			case <-abortSig:
+				return
+			case <-ticker.C:
+			}
+			if transferComplete.Load() {
+				return
+			}
+			cur := bytesPushed.Load()
+			now := time.Now()
+			dt := now.Sub(lastTime).Seconds()
+			bps := 0.0
+			if dt > 0 {
+				bps = float64(cur-lastBytes) / dt
+			}
+			lastBytes = cur
+			lastTime = now
+			states := make([]string, len(pcs))
+			for i, pc := range pcs {
+				if pc != nil {
+					states[i] = pc.ConnectionState().String()
+				} else {
+					states[i] = "nil"
+				}
+			}
+			payload, _ := json.Marshal(map[string]any{
+				"type":     "stats",
+				"role":     "sender",
+				"bytes":    cur,
+				"total":    totalBytes,
+				"speed":    int64(bps),
+				"pcStates": states,
+			})
+			_ = ws.writeRaw(payload)
+		}
+	}()
+
 	sendChunk := func(dc *webrtc.DataChannel, ch chan struct{}, seq uint32, plaintext []byte) error {
 		ct := encryptChunk(aead, plaintext, seq)
 		out := make([]byte, seqHeaderBytes+len(ct))
@@ -687,6 +788,8 @@ func runSend(args []string) {
 			}
 			select {
 			case <-ch:
+			case <-abortSig:
+				return io.EOF
 			case <-time.After(500 * time.Millisecond):
 			}
 		}
@@ -748,13 +851,22 @@ func runSend(args []string) {
 			if transferComplete.Load() {
 				break
 			}
+			select {
+			case <-abortSig:
+				return
+			default:
+			}
 			n, rerr := io.ReadFull(f, buf)
 			if n > 0 {
 				hasher.Write(buf[:n])
 				if !getBit(resumeBitmap, int(seq)) {
 					ptCopy := make([]byte, n)
 					copy(ptCopy, buf[:n])
-					chunks <- chunkData{seq: seq, pt: ptCopy}
+					select {
+					case chunks <- chunkData{seq: seq, pt: ptCopy}:
+					case <-abortSig:
+						return
+					}
 				}
 				seq++
 			}
@@ -801,6 +913,21 @@ func runSend(args []string) {
 		die(fmt.Errorf("read file: %w", v.(error)))
 	}
 
+	// If watchdog or anything else fired the abort, bail loudly. Sending a
+	// final "abort" on the control DC tells the receiver it can stop waiting.
+	select {
+	case <-abortSig:
+		reason, _ := abortReason.Load().(string)
+		if reason == "" {
+			reason = "unknown"
+		}
+		fmt.Fprintln(os.Stderr)
+		ab, _ := json.Marshal(map[string]any{"type": "abort", "reason": reason})
+		_ = controlDC.SendText(string(ab))
+		die(fmt.Errorf("transfer aborted: %s (try again — if it keeps happening, check WiFi or use a wired connection)", reason))
+	default:
+	}
+
 	// Phase 1 done — tell receiver and include fileHash for end-to-end verify.
 	finalHash, _ := fileHash.Load().(string)
 	doneMsg := map[string]any{"type": "done"}
@@ -816,6 +943,11 @@ func runSend(args []string) {
 		select {
 		case err := <-wsErr:
 			die(err)
+		case <-abortSig:
+			reason, _ := abortReason.Load().(string)
+			ab, _ := json.Marshal(map[string]any{"type": "abort", "reason": reason})
+			_ = controlDC.SendText(string(ab))
+			die(fmt.Errorf("transfer aborted during retransmit: %s", reason))
 		case <-time.After(retransmitInterval):
 		}
 		if transferComplete.Load() {
