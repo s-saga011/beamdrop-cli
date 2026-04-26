@@ -60,7 +60,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.3.1"
+var Version = "v0.3.2"
 
 const (
 	chunkSize           = 16 * 1024
@@ -86,9 +86,10 @@ const (
 	probeFastLossRatio     = 0.05            // ≤5% loss => fast mode
 	probeBadLossRatio      = 0.30            // >30% loss => suggest --relay
 	probeMinThroughput     = 1 * 1024 * 1024 // <1 MB/s receiver-side rate => suggest --relay
-	adaptiveInflightFloor  = 8 * 1024 * 1024 // never let cap drop below 8 MB (after probe)
-	adaptiveInflightMult   = 2               // cap = receiver_rate × N seconds (TCP-style BDP)
+	adaptiveInflightFloor  = 8 * 1024 * 1024 // never let cap drop below 8 MB (after probe, fast-detect path)
+	adaptiveInflightMult   = 1               // cap = receiver_rate × N seconds (lowered to 1 — 2× was overshooting on cellular bursts)
 	probeInitialCap        = 4 * 1024 * 1024 // slow-start cap until probe finishes — keeps Phase 1 from over-buffering on bad networks before we know they're bad
+	capGrowthPerRefresh    = 1 * 1024 * 1024 // AIMD: add at most 1 MB per refresh tick (every 2s)
 	resumeWaitTimeout   = 1500 * time.Millisecond
 	protocolVersion     = 3
 	defaultServer       = "https://p2p.draft-publish.com"
@@ -1150,10 +1151,12 @@ func runSend(args []string) {
 		}
 
 		// Continuously refresh cap based on receiver rate (every 2 s).
-		// Cap = rate × adaptiveInflightMult, with a 2 MB floor so we
-		// never wedge waiting for a non-zero ack delta. Fast mode opted
-		// out (cap=0) — leave it alone.
-		const refreshFloor = int64(2 * 1024 * 1024)
+		// AIMD-style: shrink immediately when rate drops, grow at most
+		// capGrowthPerRefresh per tick. This is the key behavior — we
+		// don't want a temporary burst (e.g. cellular's first second of
+		// good throughput) to widen cap to tens of MB right before the
+		// carrier shapes the flow back to ~0.
+		const refreshFloor = int64(1 * 1024 * 1024)
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 		prevAcked := ackedInProbe
@@ -1180,11 +1183,22 @@ func runSend(args []string) {
 			dt := time.Since(prevTime).Seconds()
 			if dt > 0 {
 				curRate := float64(cur-prevAcked) * chunkSize / dt
-				newCap := int64(curRate * float64(adaptiveInflightMult))
-				if newCap < refreshFloor {
-					newCap = refreshFloor
+				targetCap := int64(curRate * float64(adaptiveInflightMult))
+				if targetCap < refreshFloor {
+					targetCap = refreshFloor
 				}
-				inflightCap.Store(newCap)
+				oldCap := inflightCap.Load()
+				if targetCap > oldCap {
+					// Additive increase
+					grown := oldCap + capGrowthPerRefresh
+					if targetCap < grown {
+						grown = targetCap
+					}
+					inflightCap.Store(grown)
+				} else {
+					// Multiplicative decrease — take immediately
+					inflightCap.Store(targetCap)
+				}
 			}
 			prevAcked = cur
 			prevTime = time.Now()
