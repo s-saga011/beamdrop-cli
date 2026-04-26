@@ -60,7 +60,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.2.10"
+var Version = "v0.2.11"
 
 const (
 	chunkSize           = 16 * 1024
@@ -575,12 +575,22 @@ func runSend(args []string) {
 
 	dataDCs := make([]*webrtc.DataChannel, numPCs)
 	bufLow := make([]chan struct{}, numPCs)
+	// In --relay mode (TURN over TLS:443), the underlying transport is
+	// already TCP/TLS and reliable end-to-end; running datagram-mode data
+	// DCs on top just adds an unnecessary application-layer retransmit
+	// loop that fights SCTP's own congestion control. Make them reliable+
+	// ordered so SCTP handles loss directly.
 	for i, pc := range pcs {
 		idx := i
-		dc, err := pc.CreateDataChannel(fmt.Sprintf("file-%d", idx), &webrtc.DataChannelInit{
-			Ordered:        ptr(false),
-			MaxRetransmits: ptr(uint16(0)),
-		})
+		dcInit := &webrtc.DataChannelInit{}
+		if fl.relay {
+			dcInit.Ordered = ptr(true)
+			// MaxRetransmits left nil = full reliability
+		} else {
+			dcInit.Ordered = ptr(false)
+			dcInit.MaxRetransmits = ptr(uint16(0))
+		}
+		dc, err := pc.CreateDataChannel(fmt.Sprintf("file-%d", idx), dcInit)
 		if err != nil {
 			die(err)
 		}
