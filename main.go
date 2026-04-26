@@ -60,7 +60,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.2.2"
+var Version = "v0.2.3"
 
 const (
 	chunkSize           = 16 * 1024
@@ -1091,10 +1091,16 @@ func runSend(args []string) {
 		die(fmt.Errorf("retransmit limit reached or timeout — receiver did not confirm completion"))
 	}
 
+	// Land the progress bar on 100% before printing Done — without this,
+	// the bar can be stuck at e.g. 99.1% if the last sendChunk update
+	// happened just before the receiver's "complete" landed.
+	fmt.Printf("\r  %s 100.0%%  %s/%s                                              \n",
+		progressBar(100, 30), formatBytes(totalBytes), formatBytes(totalBytes))
+
 	elapsed := time.Since(sendStart)
 	pushed := bytesPushed.Load()
 	rate := float64(totalBytes) / elapsed.Seconds() / 1024 / 1024
-	fmt.Printf("\rDone: %s in %s (%.1f MB/s, pushed %s incl. retransmits)             \n",
+	fmt.Printf("Done: %s in %s (%.1f MB/s, pushed %s incl. retransmits)\n",
 		formatBytes(totalBytes), elapsed.Round(time.Millisecond), rate, formatBytes(pushed))
 }
 
@@ -1221,10 +1227,16 @@ func runRecv(args []string) {
 		_ = outFile.Close()
 		outFile = nil
 
+		// Land the progress bar on 100% — the per-chunk Printf is throttled
+		// to 500ms and may have last drawn at e.g. 94% when the final batch
+		// of chunks landed in one tick.
+		fmt.Printf("\r  %s 100.0%%  %s/%s                                              \n",
+			progressBar(100, 30), formatBytes(metaSize), formatBytes(metaSize))
+
 		partPath := metaName + ".part"
 		verifyMsg := ""
 		if expectedHash != "" {
-			fmt.Printf("\nVerifying SHA-256...\n")
+			fmt.Printf("Verifying SHA-256...\n")
 			got, herr := hashFileFull(partPath)
 			if herr != nil {
 				fmt.Fprintf(os.Stderr, "warn: hash %s: %v\n", partPath, herr)
@@ -1246,7 +1258,7 @@ func runRecv(args []string) {
 		}
 		elapsed := time.Since(startT)
 		rate := float64(metaSize) / elapsed.Seconds() / 1024 / 1024
-		fmt.Printf("\rDone: %s in %s (%.1f MB/s, E2E decrypted)%s                       \n",
+		fmt.Printf("Done: %s in %s (%.1f MB/s, E2E decrypted)%s\n",
 			formatBytes(metaSize), elapsed.Round(time.Millisecond), rate, verifyMsg)
 		if dc, ok := controlDC.Load().(*webrtc.DataChannel); ok && dc != nil {
 			ack, _ := json.Marshal(map[string]any{"type": "complete"})
