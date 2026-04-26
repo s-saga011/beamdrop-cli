@@ -60,7 +60,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.2.3"
+var Version = "v0.2.4"
 
 const (
 	chunkSize           = 16 * 1024
@@ -75,6 +75,7 @@ const (
 	maxRetransmitPasses   = 60
 	retransmitBatchLimit  = 2000 // chunks per pass — keep small so receiver can drain between passes
 	stagnantPassThreshold = 12   // ~3s of "no progress" passes before bailing
+	inFlightWindow        = 3 * time.Second // skip seqs sent this recently in Phase 2 (still in receiver's queue)
 	resumeWaitTimeout   = 1500 * time.Millisecond
 	protocolVersion     = 3
 	defaultServer       = "https://p2p.draft-publish.com"
@@ -917,6 +918,11 @@ func runSend(args []string) {
 	}()
 
 	sentBitmap := newBitmap(expectedChunks)
+	// Per-seq last send time (UnixNano). Used by Phase 2 to skip seqs that
+	// were sent recently (still in flight: sender's SCTP buffer / wire /
+	// receiver's pion buffer / receiver's JS decrypt queue) so we don't
+	// duplicate-blast chunks the receiver hasn't even gotten to yet.
+	lastSendNanos := make([]int64, expectedChunks)
 	var sentMu sync.Mutex
 	var wg sync.WaitGroup
 	for i := 0; i < numPCs; i++ {
@@ -933,6 +939,7 @@ func runSend(args []string) {
 				if err := sendChunk(dc, ch, cd.seq, cd.pt); err != nil {
 					return
 				}
+				atomic.StoreInt64(&lastSendNanos[cd.seq], time.Now().UnixNano())
 				sentMu.Lock()
 				setBit(sentBitmap, int(cd.seq))
 				sentMu.Unlock()
@@ -1007,16 +1014,32 @@ func runSend(args []string) {
 			continue
 		}
 		curReceivedBits := countSetBits(bm)
+		// Build missing list, but skip seqs we sent within inFlightWindow —
+		// they're still draining through sender's pion buffer, the wire, the
+		// receiver's pion buffer, and the receiver's JS decrypt queue, and
+		// resending them now would just be duplicate work that pads pushed
+		// bytes without advancing the bitmap.
+		nowNanos := time.Now().UnixNano()
+		windowNanos := int64(inFlightWindow)
 		var missing []uint32
+		var inFlight int
 		for s := 0; s < expectedChunks; s++ {
-			if !getBit(bm, s) {
-				missing = append(missing, uint32(s))
-				if len(missing) >= retransmitBatchLimit {
-					break
-				}
+			if getBit(bm, s) {
+				continue
+			}
+			last := atomic.LoadInt64(&lastSendNanos[s])
+			if last > 0 && nowNanos-last < windowNanos {
+				inFlight++
+				continue
+			}
+			missing = append(missing, uint32(s))
+			if len(missing) >= retransmitBatchLimit {
+				break
 			}
 		}
 		if len(missing) == 0 {
+			// Either nothing missing (waiting for "complete") or everything
+			// missing is still in flight — give the receiver more time.
 			continue
 		}
 		// Stagnation tracking: did the receiver's bitmap advance since the
@@ -1034,7 +1057,8 @@ func runSend(args []string) {
 		}
 		prevReceivedBits = curReceivedBits
 		pass++
-		fmt.Printf("\n  retransmit pass %d: %d missing (rcv has %d/%d)\n", pass, len(missing), curReceivedBits, expectedChunks)
+		fmt.Printf("\n  retransmit pass %d: %d to send, %d in-flight (rcv has %d/%d)\n",
+			pass, len(missing), inFlight, curReceivedBits, expectedChunks)
 		f, err := os.Open(path)
 		if err != nil {
 			die(fmt.Errorf("reopen for retransmit: %w", err))
@@ -1061,6 +1085,7 @@ func runSend(args []string) {
 			if err := sendChunk(dc, ch, s, pt); err != nil {
 				break
 			}
+			atomic.StoreInt64(&lastSendNanos[s], time.Now().UnixNano())
 		}
 		f.Close()
 	}
