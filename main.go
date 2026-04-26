@@ -60,7 +60,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.2.8"
+var Version = "v0.2.9"
 
 const (
 	chunkSize           = 16 * 1024
@@ -72,8 +72,10 @@ const (
 	prefixHashSize      = 4096
 	bitmapInterval        = 200 * time.Millisecond
 	retransmitInterval    = 250 * time.Millisecond
+	maxRetransmitInterval = 8 * time.Second // back off up to this when receiver isn't keeping up
 	maxRetransmitPasses   = 60
 	retransmitBatchLimit  = 2000 // chunks per pass — keep small so receiver can drain between passes
+	retransmitBatchMin    = 200  // floor when we shrink the batch under loss
 	stagnantPassThreshold = 12   // ~3s of "no progress" passes before bailing
 	resumeWaitTimeout   = 1500 * time.Millisecond
 	protocolVersion     = 3
@@ -1079,9 +1081,19 @@ func runSend(args []string) {
 	//   - We also give up after stagnantPassThreshold consecutive passes
 	//     where the receiver's bitmap shows zero progress (so we don't
 	//     hammer a permanently-broken DC for minutes).
+	// Adaptive interval + batch size: when the receiver's bitmap doesn't
+	// advance much between passes (delivery ratio < 10%), exponentially
+	// back off the wait time and shrink the batch — classic congestion
+	// avoidance, mirrors what TCP does on RTO. When the receiver catches
+	// up (delivery ratio > 50%), reset to base. This stops the retransmit
+	// storm where, on lossy links, our own resends compound the loss and
+	// fight SCTP's congestion control instead of working with it.
 	pass := 0
 	stagnant := 0
-	var prevReceivedBits int
+	prevReceivedBits := 0
+	prevAttempted := 0
+	curInterval := retransmitInterval
+	curBatchLimit := retransmitBatchLimit
 	for pass < maxRetransmitPasses && !transferComplete.Load() {
 		select {
 		case err := <-wsErr:
@@ -1091,7 +1103,7 @@ func runSend(args []string) {
 			ab, _ := json.Marshal(map[string]any{"type": "abort", "reason": reason})
 			_ = controlDC.SendText(string(ab))
 			die(fmt.Errorf("transfer aborted during retransmit: %s", reason))
-		case <-time.After(retransmitInterval):
+		case <-time.After(curInterval):
 		}
 		if transferComplete.Load() {
 			break
@@ -1103,21 +1115,46 @@ func runSend(args []string) {
 			continue
 		}
 		curReceivedBits := countSetBits(bm)
+
+		// Adjust pacing based on the last pass's effective delivery ratio.
+		if prevAttempted > 0 {
+			landed := curReceivedBits - prevReceivedBits
+			if landed < 0 {
+				landed = 0
+			}
+			ratio := float64(landed) / float64(prevAttempted)
+			if ratio < 0.1 {
+				// Almost nothing landed — back off.
+				curInterval *= 2
+				if curInterval > maxRetransmitInterval {
+					curInterval = maxRetransmitInterval
+				}
+				curBatchLimit = curBatchLimit / 2
+				if curBatchLimit < retransmitBatchMin {
+					curBatchLimit = retransmitBatchMin
+				}
+			} else if ratio > 0.5 {
+				// Receiver is keeping up — return to base pacing.
+				curInterval = retransmitInterval
+				curBatchLimit = retransmitBatchLimit
+			}
+		}
+
 		var missing []uint32
 		for s := 0; s < expectedChunks; s++ {
 			if !getBit(bm, s) {
 				missing = append(missing, uint32(s))
-				if len(missing) >= retransmitBatchLimit {
+				if len(missing) >= curBatchLimit {
 					break
 				}
 			}
 		}
 		if len(missing) == 0 {
+			prevAttempted = 0
+			prevReceivedBits = curReceivedBits
 			continue
 		}
-		// Stagnation tracking: did the receiver's bitmap advance since the
-		// previous pass? If not for stagnantPassThreshold passes in a row,
-		// give up.
+		// Stagnation tracking.
 		if curReceivedBits <= prevReceivedBits {
 			stagnant++
 			if stagnant >= stagnantPassThreshold {
@@ -1129,9 +1166,10 @@ func runSend(args []string) {
 			stagnant = 0
 		}
 		prevReceivedBits = curReceivedBits
+		prevAttempted = len(missing)
 		pass++
-		fmt.Printf("\n  retransmit pass %d: %d missing (rcv has %d/%d, via reliable DC)\n",
-			pass, len(missing), curReceivedBits, expectedChunks)
+		fmt.Printf("\n  retransmit pass %d: %d missing (rcv has %d/%d, batch=%d, wait=%s)\n",
+			pass, len(missing), curReceivedBits, expectedChunks, curBatchLimit, curInterval)
 		f, err := os.Open(path)
 		if err != nil {
 			die(fmt.Errorf("reopen for retransmit: %w", err))
