@@ -60,7 +60,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.2.11"
+var Version = "v0.2.12"
 
 const (
 	chunkSize           = 16 * 1024
@@ -77,6 +77,7 @@ const (
 	retransmitBatchLimit  = 2000 // chunks per pass — keep small so receiver can drain between passes
 	retransmitBatchMin    = 200  // floor when we shrink the batch under loss
 	stagnantPassThreshold = 12   // ~3s of "no progress" passes before bailing
+	relayInflightWindow   = 1000 // sender stays at most this many chunks (16MB) ahead of receiver bitmap in --relay mode
 	resumeWaitTimeout   = 1500 * time.Millisecond
 	protocolVersion     = 3
 	defaultServer       = "https://p2p.draft-publish.com"
@@ -1043,6 +1044,40 @@ func runSend(args []string) {
 
 	sentBitmap := newBitmap(expectedChunks)
 	var sentMu sync.Mutex
+	// In --relay (reliable+TCP/TLS) mode, pion's BufferedAmount() doesn't
+	// reflect data sitting in the underlying TCP send queue / TURN server
+	// buffer / receiver's TCP recv queue, so the bufferedHigh-based drain
+	// in sendChunk fires almost never — the worker can dump 504MB into
+	// the reliable DC in a few seconds while the wire is doing 200 KB/s,
+	// stuffing ~500MB into downstream buffers and triggering carrier
+	// congestion. To bound that, gate each chunk on receiver-bitmap
+	// progress: don't run more than relayInflightWindow chunks ahead of
+	// what the receiver has acked.
+	waitInflight := func(seq uint32) {
+		if !fl.relay {
+			return
+		}
+		for {
+			if transferComplete.Load() {
+				return
+			}
+			recvBitmapMu.Lock()
+			rb := recvBitmap
+			recvBitmapMu.Unlock()
+			ackedCount := 0
+			if rb != nil {
+				ackedCount = countSetBits(rb)
+			}
+			if int(seq)-ackedCount < relayInflightWindow {
+				return
+			}
+			select {
+			case <-abortSig:
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+	}
 	var wg sync.WaitGroup
 	for i := 0; i < numPCs; i++ {
 		wg.Add(1)
@@ -1055,6 +1090,7 @@ func runSend(args []string) {
 				if transferComplete.Load() {
 					return
 				}
+				waitInflight(cd.seq)
 				if err := sendChunk(dc, ch, cd.seq, cd.pt); err != nil {
 					return
 				}
