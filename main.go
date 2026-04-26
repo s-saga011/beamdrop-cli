@@ -60,7 +60,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.2.6"
+var Version = "v0.2.7"
 
 const (
 	chunkSize           = 16 * 1024
@@ -591,6 +591,14 @@ func runSend(args []string) {
 			}
 			recvBitmap = bm
 			recvBitmapVer = m.Version
+			// Treat a fully-set bitmap as proof of completion. The
+			// receiver's explicit {type:"complete"} can be delayed by
+			// OPFS finalize (worker write queue drain on slow NAND) or
+			// lost if the control DC has issues, so don't depend on it
+			// alone — the bitmap is the truth.
+			if countSetBits(bm) >= expectedChunks {
+				transferComplete.Store(true)
+			}
 		case "complete":
 			transferComplete.Store(true)
 		}
