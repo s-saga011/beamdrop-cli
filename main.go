@@ -60,7 +60,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.2.9"
+var Version = "v0.2.10"
 
 const (
 	chunkSize           = 16 * 1024
@@ -424,6 +424,21 @@ func parseFlags(args []string) flags {
 	return out
 }
 
+// newRelayAPI returns a *webrtc.API whose ICE agent gathers TCP candidates.
+// pion v4 defaults to UDP-only network types, which silently drops every
+// turn:host:port?transport=tcp / turns:host:443 URL on the floor (the
+// candidate pool ends up empty and ICE fails with "no candidate pairs").
+func newRelayAPI() *webrtc.API {
+	se := webrtc.SettingEngine{}
+	se.SetNetworkTypes([]webrtc.NetworkType{
+		webrtc.NetworkTypeUDP4,
+		webrtc.NetworkTypeUDP6,
+		webrtc.NetworkTypeTCP4,
+		webrtc.NetworkTypeTCP6,
+	})
+	return webrtc.NewAPI(webrtc.WithSettingEngine(se))
+}
+
 // filterRelayTLS narrows iceServers to only the TLS:443 turns: URL,
 // dropping STUN and other TURN candidates. Used together with
 // ICETransportPolicyRelay to force every ICE pair through TLS/443/TCP —
@@ -512,6 +527,7 @@ func runSend(args []string) {
 		iceServers = []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}
 	}
 	pcConfig := webrtc.Configuration{ICEServers: iceServers}
+	pcAPI := webrtc.NewAPI() // default UDP-only — fine for direct/UDP-TURN paths
 	if fl.relay {
 		filtered := filterRelayTLS(iceServers)
 		if len(filtered) == 0 {
@@ -519,6 +535,7 @@ func runSend(args []string) {
 		}
 		pcConfig.ICEServers = filtered
 		pcConfig.ICETransportPolicy = webrtc.ICETransportPolicyRelay
+		pcAPI = newRelayAPI() // pion v4 won't gather TCP candidates without this
 		fmt.Println("Relay mode: forcing all traffic through TURN over TLS:443")
 	}
 
@@ -531,7 +548,7 @@ func runSend(args []string) {
 
 	pcs := make([]*webrtc.PeerConnection, numPCs)
 	for i := 0; i < numPCs; i++ {
-		pc, err := webrtc.NewPeerConnection(pcConfig)
+		pc, err := pcAPI.NewPeerConnection(pcConfig)
 		if err != nil {
 			die(err)
 		}
@@ -1291,6 +1308,7 @@ func runRecv(args []string) {
 	}
 	relayOn := fl.relay || st.relay
 	pcConfig := webrtc.Configuration{ICEServers: iceServers}
+	pcAPI := webrtc.NewAPI()
 	if relayOn {
 		filtered := filterRelayTLS(iceServers)
 		if len(filtered) == 0 {
@@ -1298,6 +1316,7 @@ func runRecv(args []string) {
 		}
 		pcConfig.ICEServers = filtered
 		pcConfig.ICETransportPolicy = webrtc.ICETransportPolicyRelay
+		pcAPI = newRelayAPI() // pion v4 needs TCP NetworkTypes for turns: candidates
 		fmt.Println("Relay mode: forcing all traffic through TURN over TLS:443")
 	}
 
@@ -1619,7 +1638,7 @@ func runRecv(args []string) {
 		if pcs[idx] != nil {
 			return pcs[idx], nil
 		}
-		pc, err := webrtc.NewPeerConnection(pcConfig)
+		pc, err := pcAPI.NewPeerConnection(pcConfig)
 		if err != nil {
 			return nil, err
 		}
