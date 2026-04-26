@@ -60,7 +60,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.3.0"
+var Version = "v0.3.1"
 
 const (
 	chunkSize           = 16 * 1024
@@ -86,8 +86,9 @@ const (
 	probeFastLossRatio     = 0.05            // ≤5% loss => fast mode
 	probeBadLossRatio      = 0.30            // >30% loss => suggest --relay
 	probeMinThroughput     = 1 * 1024 * 1024 // <1 MB/s receiver-side rate => suggest --relay
-	adaptiveInflightFloor  = 8 * 1024 * 1024 // never let cap drop below 8 MB
+	adaptiveInflightFloor  = 8 * 1024 * 1024 // never let cap drop below 8 MB (after probe)
 	adaptiveInflightMult   = 2               // cap = receiver_rate × N seconds (TCP-style BDP)
+	probeInitialCap        = 4 * 1024 * 1024 // slow-start cap until probe finishes — keeps Phase 1 from over-buffering on bad networks before we know they're bad
 	resumeWaitTimeout   = 1500 * time.Millisecond
 	protocolVersion     = 3
 	defaultServer       = "https://p2p.draft-publish.com"
@@ -1058,7 +1059,16 @@ func runSend(args []string) {
 	// Adaptive in-flight cap for non-relay mode. Set by the probe monitor
 	// goroutine below. 0 = no app-layer throttle (fast mode); >0 = bytes
 	// allowed between sender and receiver before the sender waits.
+	//
+	// Start with a conservative cap (slow start). Otherwise on bad networks
+	// the workers can dump tens of megabytes of datagrams into pion's send
+	// queue during the 1.5 s probe window itself — by the time probe
+	// detects 'bad', the queue is already so big that the sender wedges
+	// waiting for the receiver to drain it.
 	var inflightCap atomic.Int64
+	if !fl.relay {
+		inflightCap.Store(int64(probeInitialCap))
+	}
 
 	// Probe + adaptive throttle goroutine.
 	//
@@ -1119,8 +1129,14 @@ func runSend(args []string) {
 			rate/1024/1024, lossRatio*100, ackedInProbe, probeChunks, elapsed)
 
 		if !fl.relay && (lossRatio > probeBadLossRatio || rate < float64(probeMinThroughput)) {
-			fmt.Println("  → BAD network. If this transfer crawls, abort and retry with --relay.")
-			inflightCap.Store(int64(adaptiveInflightFloor))
+			// Bad network: keep sender close to wire rate. Floor at 2 MB
+			// (~1 RTT worth at typical mobile latency); cap = rate × 2.
+			cap := int64(rate * float64(adaptiveInflightMult))
+			if cap < 2*1024*1024 {
+				cap = 2 * 1024 * 1024
+			}
+			inflightCap.Store(cap)
+			fmt.Printf("  → BAD network (cap %s). If this crawls, abort and retry with --relay.\n", formatBytes(cap))
 		} else if !fl.relay && (lossRatio > probeFastLossRatio || rate < float64(probeFastThroughput)) {
 			cap := int64(rate * float64(adaptiveInflightMult))
 			if cap < int64(adaptiveInflightFloor) {
@@ -1130,10 +1146,14 @@ func runSend(args []string) {
 			fmt.Printf("  → steady mode (adaptive in-flight cap %s)\n", formatBytes(cap))
 		} else if !fl.relay {
 			fmt.Println("  → fast mode (no application throttle)")
-			// inflightCap stays 0
+			inflightCap.Store(0) // release initial slow-start cap
 		}
 
 		// Continuously refresh cap based on receiver rate (every 2 s).
+		// Cap = rate × adaptiveInflightMult, with a 2 MB floor so we
+		// never wedge waiting for a non-zero ack delta. Fast mode opted
+		// out (cap=0) — leave it alone.
+		const refreshFloor = int64(2 * 1024 * 1024)
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 		prevAcked := ackedInProbe
@@ -1161,8 +1181,8 @@ func runSend(args []string) {
 			if dt > 0 {
 				curRate := float64(cur-prevAcked) * chunkSize / dt
 				newCap := int64(curRate * float64(adaptiveInflightMult))
-				if newCap < int64(adaptiveInflightFloor) {
-					newCap = int64(adaptiveInflightFloor)
+				if newCap < refreshFloor {
+					newCap = refreshFloor
 				}
 				inflightCap.Store(newCap)
 			}
