@@ -60,7 +60,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.2.7"
+var Version = "v0.2.8"
 
 const (
 	chunkSize           = 16 * 1024
@@ -145,22 +145,34 @@ type shareTarget struct {
 	server string
 	room   string
 	keyB64 string
+	relay  bool
 }
 
-func extractKeyFromFragment(frag string) string {
+// parseFragmentParams returns each `name=value` pair found in the fragment.
+func parseFragmentParams(frag string) map[string]string {
+	out := map[string]string{}
 	if frag == "" {
-		return ""
+		return out
 	}
 	for _, kv := range strings.Split(frag, "&") {
-		if strings.HasPrefix(kv, "k=") {
-			return kv[2:]
+		eq := strings.Index(kv, "=")
+		if eq < 0 {
+			continue
 		}
+		out[kv[:eq]] = kv[eq+1:]
 	}
-	return ""
+	return out
 }
 
 func parseShareTarget(arg, fallbackServer string) (shareTarget, error) {
 	out := shareTarget{server: fallbackServer}
+	applyFrag := func(frag string) {
+		params := parseFragmentParams(frag)
+		out.keyB64 = params["k"]
+		if v := params["relay"]; v == "1" || v == "true" {
+			out.relay = true
+		}
+	}
 	if strings.HasPrefix(arg, "http://") || strings.HasPrefix(arg, "https://") {
 		u, err := url.Parse(arg)
 		if err != nil {
@@ -172,12 +184,12 @@ func parseShareTarget(arg, fallbackServer string) (shareTarget, error) {
 			return out, fmt.Errorf("URL must be of form server/r/ROOM[#k=KEY]")
 		}
 		out.room = parts[1]
-		out.keyB64 = extractKeyFromFragment(u.Fragment)
+		applyFrag(u.Fragment)
 		return out, nil
 	}
 	if hashIdx := strings.Index(arg, "#"); hashIdx >= 0 {
 		out.room = arg[:hashIdx]
-		out.keyB64 = extractKeyFromFragment(arg[hashIdx+1:])
+		applyFrag(arg[hashIdx+1:])
 		return out, nil
 	}
 	out.room = arg
@@ -364,14 +376,17 @@ func usage() {
 	fmt.Fprint(os.Stderr, `beamdrop CLI — high-speed P2P file transfer
 
 Usage:
-  beamdrop send <file> [--server URL]
+  beamdrop send <file> [--server URL] [--relay]
   beamdrop recv <url>             # share URL printed by 'send' (must include #k=KEY)
-  beamdrop recv <room#k=KEY> [--server URL]
+  beamdrop recv <room#k=KEY> [--server URL] [--relay]
   beamdrop update                 # download the latest release in place
   beamdrop --version              # print current version
 
-Defaults:
-  --server  https://p2p.draft-publish.com
+Flags:
+  --server URL  override signaling server (default: https://p2p.draft-publish.com)
+  --relay       force-route through Cloudflare TURN over TLS:443. Bypasses
+                cellular carrier UDP/P2P shaping. Use when a mobile-network
+                transfer crawls; otherwise leave off.
 `)
 	os.Exit(1)
 }
@@ -381,22 +396,57 @@ func die(err error) {
 	os.Exit(1)
 }
 
-func parseFlags(args []string) (string, []string) {
-	server := defaultServer
-	var positional []string
+// flags is the parsed result of parseFlags.
+type flags struct {
+	server string
+	relay  bool
+	pos    []string
+}
+
+func parseFlags(args []string) flags {
+	out := flags{server: defaultServer}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch a {
 		case "--server":
 			i++
 			if i < len(args) {
-				server = args[i]
+				out.server = args[i]
 			}
+		case "--relay":
+			out.relay = true
 		default:
-			positional = append(positional, a)
+			out.pos = append(out.pos, a)
 		}
 	}
-	return server, positional
+	return out
+}
+
+// filterRelayTLS narrows iceServers to only the TLS:443 turns: URL,
+// dropping STUN and other TURN candidates. Used together with
+// ICETransportPolicyRelay to force every ICE pair through TLS/443/TCP —
+// the path that survives mobile-carrier UDP/P2P shaping (mimics HTTPS).
+func filterRelayTLS(iceServers []webrtc.ICEServer) []webrtc.ICEServer {
+	out := make([]webrtc.ICEServer, 0, len(iceServers))
+	for _, s := range iceServers {
+		var keep []string
+		for _, u := range s.URLs {
+			lu := strings.ToLower(u)
+			if strings.HasPrefix(lu, "turns:") &&
+				strings.Contains(lu, ":443") &&
+				strings.Contains(lu, "transport=tcp") {
+				keep = append(keep, u)
+			}
+		}
+		if len(keep) > 0 {
+			out = append(out, webrtc.ICEServer{
+				URLs:       keep,
+				Username:   s.Username,
+				Credential: s.Credential,
+			})
+		}
+	}
+	return out
 }
 
 func ptr[T any](v T) *T { return &v }
@@ -407,11 +457,12 @@ func ptr[T any](v T) *T { return &v }
 
 func runSend(args []string) {
 	checkForUpdate()
-	server, pos := parseFlags(args)
-	if len(pos) < 1 {
+	fl := parseFlags(args)
+	if len(fl.pos) < 1 {
 		die(fmt.Errorf("usage: beamdrop send <file>"))
 	}
-	path := pos[0]
+	server := fl.server
+	path := fl.pos[0]
 
 	stat, err := os.Stat(path)
 	if err != nil {
@@ -445,12 +496,28 @@ func runSend(args []string) {
 		die(fmt.Errorf("createRoom: %w", err))
 	}
 	shareURL := fmt.Sprintf("%s/r/%s#k=%s", server, room, keyB64)
+	if fl.relay {
+		// Carry the relay hint in the URL so the receiver also force-routes
+		// through TURN/TLS:443. Otherwise ICE on the receiver's side might
+		// pick a faster (UDP) candidate that the carrier then shapes anyway.
+		shareURL += "&relay=1"
+	}
 	printShareInstructions(room, shareURL)
 
 	iceServers, err := fetchICE(server)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warn: fetchICE failed: %v (using STUN only)\n", err)
 		iceServers = []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}
+	}
+	pcConfig := webrtc.Configuration{ICEServers: iceServers}
+	if fl.relay {
+		filtered := filterRelayTLS(iceServers)
+		if len(filtered) == 0 {
+			die(fmt.Errorf("--relay requested but no TLS:443 TURN URL available from %s/api/turn", server))
+		}
+		pcConfig.ICEServers = filtered
+		pcConfig.ICETransportPolicy = webrtc.ICETransportPolicyRelay
+		fmt.Println("Relay mode: forcing all traffic through TURN over TLS:443")
 	}
 
 	wsConn, err := dialSignaling(server, room)
@@ -462,7 +529,7 @@ func runSend(args []string) {
 
 	pcs := make([]*webrtc.PeerConnection, numPCs)
 	for i := 0; i < numPCs; i++ {
-		pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: iceServers})
+		pc, err := webrtc.NewPeerConnection(pcConfig)
 		if err != nil {
 			die(err)
 		}
@@ -1146,11 +1213,12 @@ func runSend(args []string) {
 
 func runRecv(args []string) {
 	checkForUpdate()
-	server, pos := parseFlags(args)
-	if len(pos) < 1 {
+	fl := parseFlags(args)
+	if len(fl.pos) < 1 {
 		die(fmt.Errorf("usage: beamdrop recv <url-or-room>"))
 	}
-	target := pos[0]
+	server := fl.server
+	target := fl.pos[0]
 
 	st, err := parseShareTarget(target, server)
 	if err != nil {
@@ -1182,6 +1250,17 @@ func runRecv(args []string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warn: fetchICE failed: %v\n", err)
 		iceServers = []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}
+	}
+	relayOn := fl.relay || st.relay
+	pcConfig := webrtc.Configuration{ICEServers: iceServers}
+	if relayOn {
+		filtered := filterRelayTLS(iceServers)
+		if len(filtered) == 0 {
+			die(fmt.Errorf("relay requested but no TLS:443 TURN URL available from %s/api/turn", server))
+		}
+		pcConfig.ICEServers = filtered
+		pcConfig.ICETransportPolicy = webrtc.ICETransportPolicyRelay
+		fmt.Println("Relay mode: forcing all traffic through TURN over TLS:443")
 	}
 
 	wsConn, err := dialSignaling(server, room)
@@ -1502,7 +1581,7 @@ func runRecv(args []string) {
 		if pcs[idx] != nil {
 			return pcs[idx], nil
 		}
-		pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: iceServers})
+		pc, err := webrtc.NewPeerConnection(pcConfig)
 		if err != nil {
 			return nil, err
 		}
