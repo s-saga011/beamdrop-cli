@@ -60,7 +60,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.3.2"
+var Version = "v0.3.3"
 
 const (
 	chunkSize           = 16 * 1024
@@ -559,8 +559,19 @@ func runSend(args []string) {
 	defer wsConn.Close()
 	ws := &safeWS{conn: wsConn}
 
-	pcs := make([]*webrtc.PeerConnection, numPCs)
-	for i := 0; i < numPCs; i++ {
+	// In --relay mode use a single PC. Allocating four parallel TURN
+	// allocations over TLS:443 from the same mobile IP appears to hit
+	// per-IP simultaneous-allocation limits at Cloudflare or in Chrome
+	// itself, with most allocations silently failing — so the DCs never
+	// open and the receiver tab sits at 'シグナリングサーバーに接続中'.
+	// Reliability path doesn't benefit from 4 parallel SCTPs the way
+	// datagram does (TCP serializes anyway), so 1 PC is plenty.
+	effectivePCs := numPCs
+	if fl.relay {
+		effectivePCs = 1
+	}
+	pcs := make([]*webrtc.PeerConnection, effectivePCs)
+	for i := 0; i < effectivePCs; i++ {
 		pc, err := pcAPI.NewPeerConnection(pcConfig)
 		if err != nil {
 			die(err)
@@ -586,8 +597,8 @@ func runSend(args []string) {
 		})
 	}
 
-	dataDCs := make([]*webrtc.DataChannel, numPCs)
-	bufLow := make([]chan struct{}, numPCs)
+	dataDCs := make([]*webrtc.DataChannel, effectivePCs)
+	bufLow := make([]chan struct{}, effectivePCs)
 	// In --relay mode (TURN over TLS:443), the underlying transport is
 	// already TCP/TLS and reliable end-to-end; running datagram-mode data
 	// DCs on top just adds an unnecessary application-layer retransmit
@@ -643,7 +654,7 @@ func runSend(args []string) {
 		}
 	})
 
-	totalDCs := numPCs + 2 // 4 file-N + 1 control + 1 retransmit
+	totalDCs := effectivePCs + 2 // file-N × effectivePCs + 1 control + 1 retransmit
 	openCh := make(chan struct{}, totalDCs)
 	for _, dc := range dataDCs {
 		dc.OnOpen(func() { openCh <- struct{}{} })
@@ -728,7 +739,7 @@ func runSend(args []string) {
 			if msg.PcIdx != nil {
 				idx = *msg.PcIdx
 			}
-			if idx < 0 || idx >= numPCs {
+			if idx < 0 || idx >= effectivePCs {
 				idx = 0
 			}
 			switch msg.Type {
@@ -1276,7 +1287,7 @@ func runSend(args []string) {
 		}
 	}
 	var wg sync.WaitGroup
-	for i := 0; i < numPCs; i++ {
+	for i := 0; i < effectivePCs; i++ {
 		wg.Add(1)
 		idx := i
 		go func() {
