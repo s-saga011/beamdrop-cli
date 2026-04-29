@@ -60,7 +60,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.3.3"
+var Version = "v0.4.0"
 
 const (
 	chunkSize           = 16 * 1024
@@ -80,16 +80,6 @@ const (
 	relayInflightWindow = 1000 // chunks (16MB) — relay-only cap, since pion bufferedAmount under-reports on TCP/TLS
 
 	// Phase 0 probe + adaptive throttle params
-	probeChunks            = 100              // chunks pushed before measuring
-	probeWaitTime          = 1500 * time.Millisecond
-	probeFastThroughput    = 5 * 1024 * 1024 // ≥5 MB/s receiver-side rate => fast mode (no throttle)
-	probeFastLossRatio     = 0.05            // ≤5% loss => fast mode
-	probeBadLossRatio      = 0.30            // >30% loss => suggest --relay
-	probeMinThroughput     = 1 * 1024 * 1024 // <1 MB/s receiver-side rate => suggest --relay
-	adaptiveInflightFloor  = 8 * 1024 * 1024 // never let cap drop below 8 MB (after probe, fast-detect path)
-	adaptiveInflightMult   = 1               // cap = receiver_rate × N seconds (lowered to 1 — 2× was overshooting on cellular bursts)
-	probeInitialCap        = 4 * 1024 * 1024 // slow-start cap until probe finishes — keeps Phase 1 from over-buffering on bad networks before we know they're bad
-	capGrowthPerRefresh    = 1 * 1024 * 1024 // AIMD: add at most 1 MB per refresh tick (every 2s)
 	resumeWaitTimeout   = 1500 * time.Millisecond
 	protocolVersion     = 3
 	defaultServer       = "https://p2p.draft-publish.com"
@@ -586,14 +576,22 @@ func runSend(args []string) {
 		idx := i
 		pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 			if c == nil {
+				fmt.Fprintf(os.Stderr, "[pc%d] ICE gathering done\n", idx)
 				return
 			}
+			ci := c.ToJSON()
+			fmt.Fprintf(os.Stderr, "[pc%d] local cand: %s\n", idx, ci.Candidate)
 			rid, _ := remotePeerID.Load().(string)
 			if rid == "" {
 				return
 			}
-			ci := c.ToJSON()
 			_ = ws.write(sigMsg{Type: "ice", To: rid, Candidate: &ci, PcIdx: ptr(idx)})
+		})
+		pc.OnICEConnectionStateChange(func(s webrtc.ICEConnectionState) {
+			fmt.Fprintf(os.Stderr, "[pc%d] ICE state: %s\n", idx, s.String())
+		})
+		pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+			fmt.Fprintf(os.Stderr, "[pc%d] PC state: %s\n", idx, s.String())
 		})
 	}
 
@@ -742,9 +740,11 @@ func runSend(args []string) {
 			if idx < 0 || idx >= effectivePCs {
 				idx = 0
 			}
+			fmt.Fprintf(os.Stderr, "[ws] recv type=%s peer=%s pcIdx=%d\n", msg.Type, msg.PeerID, idx)
 			switch msg.Type {
 			case "joined":
 			case "peer-joined":
+				fmt.Fprintf(os.Stderr, "[ws] peer-joined → creating offer for %d pc(s)\n", len(pcs))
 				remotePeerID.Store(msg.PeerID)
 				for i, pc := range pcs {
 					pcIdx := i
@@ -752,12 +752,15 @@ func runSend(args []string) {
 					go func() {
 						offer, err := p.CreateOffer(nil)
 						if err != nil {
+							fmt.Fprintf(os.Stderr, "[pc%d] CreateOffer error: %v\n", pcIdx, err)
 							return
 						}
 						if err := p.SetLocalDescription(offer); err != nil {
+							fmt.Fprintf(os.Stderr, "[pc%d] SetLocalDescription error: %v\n", pcIdx, err)
 							return
 						}
 						rid, _ := remotePeerID.Load().(string)
+						fmt.Fprintf(os.Stderr, "[pc%d] sending offer to %s\n", pcIdx, rid)
 						_ = ws.write(sigMsg{Type: "offer", To: rid, SDP: &offer, PcIdx: ptr(pcIdx)})
 					}()
 				}
@@ -1068,154 +1071,6 @@ func runSend(args []string) {
 	sentBitmap := newBitmap(expectedChunks)
 	var sentMu sync.Mutex
 
-	// Adaptive in-flight cap for non-relay mode. Set by the probe monitor
-	// goroutine below. 0 = no app-layer throttle (fast mode); >0 = bytes
-	// allowed between sender and receiver before the sender waits.
-	//
-	// Start with a conservative cap (slow start). Otherwise on bad networks
-	// the workers can dump tens of megabytes of datagrams into pion's send
-	// queue during the 1.5 s probe window itself — by the time probe
-	// detects 'bad', the queue is already so big that the sender wedges
-	// waiting for the receiver to drain it.
-	var inflightCap atomic.Int64
-	if !fl.relay {
-		inflightCap.Store(int64(probeInitialCap))
-	}
-
-	// Probe + adaptive throttle goroutine.
-	//
-	// Phase 0 idea: push the first probeChunks (≈1.6 MB) with no throttle,
-	// wait probeWaitTime for the receiver's bitmap to catch up, then look
-	// at how many of those chunks landed and how fast.
-	//
-	//   loss < 5%  & rate > 5 MB/s  →  fast mode (no extra throttle)
-	//   loss 5-30%                  →  steady mode (cap = rate × 2)
-	//   loss > 30% / rate < 1 MB/s  →  bad-network warning (suggest --relay)
-	//
-	// After probe, keep updating cap every 2s based on observed receiver
-	// rate so the cap follows wire conditions over the life of the
-	// transfer (mobile cellular drops mid-transfer; TURN routes shift).
-	go func() {
-		// Wait until enough chunks pushed for a meaningful sample.
-		for !transferComplete.Load() {
-			if bytesPushed.Load() >= int64(probeChunks)*chunkSize {
-				break
-			}
-			select {
-			case <-abortSig:
-				return
-			case <-time.After(50 * time.Millisecond):
-			}
-		}
-		if transferComplete.Load() {
-			return
-		}
-		probeMarkTime := time.Now()
-		select {
-		case <-abortSig:
-			return
-		case <-time.After(probeWaitTime):
-		}
-		if transferComplete.Load() {
-			return
-		}
-		recvBitmapMu.Lock()
-		rb := recvBitmap
-		recvBitmapMu.Unlock()
-		ackedInProbe := 0
-		if rb != nil {
-			for s := 0; s < probeChunks; s++ {
-				if getBit(rb, s) {
-					ackedInProbe++
-				}
-			}
-		}
-		elapsed := time.Since(probeMarkTime).Seconds()
-		var rate float64
-		if elapsed > 0 {
-			rate = float64(ackedInProbe) * chunkSize / elapsed
-		}
-		lossRatio := 1.0 - float64(ackedInProbe)/float64(probeChunks)
-
-		fmt.Printf("\n  probe: rate=%.1f MB/s, loss=%.0f%% (%d/%d landed in %.1fs)\n",
-			rate/1024/1024, lossRatio*100, ackedInProbe, probeChunks, elapsed)
-
-		if !fl.relay && (lossRatio > probeBadLossRatio || rate < float64(probeMinThroughput)) {
-			// Bad network: keep sender close to wire rate. Floor at 2 MB
-			// (~1 RTT worth at typical mobile latency); cap = rate × 2.
-			cap := int64(rate * float64(adaptiveInflightMult))
-			if cap < 2*1024*1024 {
-				cap = 2 * 1024 * 1024
-			}
-			inflightCap.Store(cap)
-			fmt.Printf("  → BAD network (cap %s). If this crawls, abort and retry with --relay.\n", formatBytes(cap))
-		} else if !fl.relay && (lossRatio > probeFastLossRatio || rate < float64(probeFastThroughput)) {
-			cap := int64(rate * float64(adaptiveInflightMult))
-			if cap < int64(adaptiveInflightFloor) {
-				cap = int64(adaptiveInflightFloor)
-			}
-			inflightCap.Store(cap)
-			fmt.Printf("  → steady mode (adaptive in-flight cap %s)\n", formatBytes(cap))
-		} else if !fl.relay {
-			fmt.Println("  → fast mode (no application throttle)")
-			inflightCap.Store(0) // release initial slow-start cap
-		}
-
-		// Continuously refresh cap based on receiver rate (every 2 s).
-		// AIMD-style: shrink immediately when rate drops, grow at most
-		// capGrowthPerRefresh per tick. This is the key behavior — we
-		// don't want a temporary burst (e.g. cellular's first second of
-		// good throughput) to widen cap to tens of MB right before the
-		// carrier shapes the flow back to ~0.
-		const refreshFloor = int64(1 * 1024 * 1024)
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		prevAcked := ackedInProbe
-		prevTime := time.Now()
-		for {
-			select {
-			case <-abortSig:
-				return
-			case <-ticker.C:
-			}
-			if transferComplete.Load() {
-				return
-			}
-			if inflightCap.Load() == 0 {
-				continue // fast mode — don't enable throttle
-			}
-			recvBitmapMu.Lock()
-			rb := recvBitmap
-			recvBitmapMu.Unlock()
-			if rb == nil {
-				continue
-			}
-			cur := countSetBits(rb)
-			dt := time.Since(prevTime).Seconds()
-			if dt > 0 {
-				curRate := float64(cur-prevAcked) * chunkSize / dt
-				targetCap := int64(curRate * float64(adaptiveInflightMult))
-				if targetCap < refreshFloor {
-					targetCap = refreshFloor
-				}
-				oldCap := inflightCap.Load()
-				if targetCap > oldCap {
-					// Additive increase
-					grown := oldCap + capGrowthPerRefresh
-					if targetCap < grown {
-						grown = targetCap
-					}
-					inflightCap.Store(grown)
-				} else {
-					// Multiplicative decrease — take immediately
-					inflightCap.Store(targetCap)
-				}
-			}
-			prevAcked = cur
-			prevTime = time.Now()
-		}
-	}()
-
 	// In --relay (reliable+TCP/TLS) mode, pion's BufferedAmount() doesn't
 	// reflect the underlying TCP/TURN/recv-side queue depth, so the
 	// bufferedHigh-based throttle in sendChunk fires almost never and the
@@ -1223,60 +1078,23 @@ func runSend(args []string) {
 	// then triggers carrier congestion, the 'starts fast, dies fast'
 	// cellular pattern). Bound it with a bitmap-derived window — same
 	// idea as TCP's send window. Only enable on relay; on direct UDP path
-	// the existing bufferedAmount throttle is sufficient (pion's SCTP-
-	// level bufferedAmount works for plain UDP) and bitmap-based capping
-	// would unnecessarily slow healthy WiFi/LAN by waiting on the
-	// receiver's per-chunk decode rate.
+	// pion's SCTP-level bufferedAmount throttle in sendChunk is sufficient.
 	waitInflight := func(seq uint32) {
-		// --relay: tight chunk-count cap (pion bufferedAmount under-reports
-		// on TCP/TLS so the underlying TURN/recv buffer can balloon
-		// without us noticing).
-		if fl.relay {
-			for {
-				if transferComplete.Load() {
-					return
-				}
-				recvBitmapMu.Lock()
-				rb := recvBitmap
-				recvBitmapMu.Unlock()
-				ackedCount := 0
-				if rb != nil {
-					ackedCount = countSetBits(rb)
-				}
-				if int(seq)-ackedCount < relayInflightWindow {
-					return
-				}
-				select {
-				case <-abortSig:
-					return
-				case <-time.After(50 * time.Millisecond):
-				}
-			}
-		}
-		// Non-relay: rely on the probe goroutine's adaptive byte cap.
-		// 0 = fast mode (no throttle, return immediately). Non-zero =
-		// steady or bad-network mode; gate on inflight bytes.
-		cap := inflightCap.Load()
-		if cap == 0 {
+		if !fl.relay {
 			return
 		}
 		for {
 			if transferComplete.Load() {
 				return
 			}
-			cap = inflightCap.Load()
-			if cap == 0 {
-				return
-			}
 			recvBitmapMu.Lock()
 			rb := recvBitmap
 			recvBitmapMu.Unlock()
-			ackedBytes := int64(0)
+			ackedCount := 0
 			if rb != nil {
-				ackedBytes = int64(countSetBits(rb)) * chunkSize
+				ackedCount = countSetBits(rb)
 			}
-			pushed := bytesPushed.Load()
-			if pushed-ackedBytes < cap {
+			if int(seq)-ackedCount < relayInflightWindow {
 				return
 			}
 			select {
