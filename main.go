@@ -60,7 +60,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.4.0"
+var Version = "v0.5.0"
 
 const (
 	chunkSize           = 16 * 1024
@@ -70,6 +70,7 @@ const (
 	seqHeaderBytes      = 4
 	ivLength            = 12
 	prefixHashSize      = 4096
+	probeSeqBase        = 0xFFF00000 // data frames with seq >= this are bandwidth-probe dummies
 	bitmapInterval        = 200 * time.Millisecond
 	retransmitInterval    = 250 * time.Millisecond
 	maxRetransmitInterval = 8 * time.Second // back off up to this when receiver isn't keeping up
@@ -129,21 +130,23 @@ func newAEAD(key []byte) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
-// chunkIV builds the per-chunk IV. Browser writes:
-//   new DataView(iv.buffer).setBigUint64(4, BigInt(seq))
-// — leading 4 zero bytes followed by big-endian uint64(seq).
-func chunkIV(seq uint32) []byte {
+// chunkIV builds the per-chunk IV: BE32(fileIdx) || BE64(seq). seq restarts
+// at 0 for every file of a batch, so fileIdx in the IV is what keeps
+// (key, IV) pairs unique — GCM nonce reuse would be fatal. fileIdx=0 keeps
+// single-file transfers byte-identical to pre-batch clients.
+func chunkIV(seq uint32, fileIdx uint32) []byte {
 	iv := make([]byte, ivLength)
+	binary.BigEndian.PutUint32(iv[0:], fileIdx)
 	binary.BigEndian.PutUint64(iv[4:], uint64(seq))
 	return iv
 }
 
-func encryptChunk(aead cipher.AEAD, pt []byte, seq uint32) []byte {
-	return aead.Seal(nil, chunkIV(seq), pt, nil)
+func encryptChunk(aead cipher.AEAD, pt []byte, seq uint32, fileIdx uint32) []byte {
+	return aead.Seal(nil, chunkIV(seq, fileIdx), pt, nil)
 }
 
-func decryptChunk(aead cipher.AEAD, ct []byte, seq uint32) ([]byte, error) {
-	return aead.Open(nil, chunkIV(seq), ct, nil)
+func decryptChunk(aead cipher.AEAD, ct []byte, seq uint32, fileIdx uint32) ([]byte, error) {
+	return aead.Open(nil, chunkIV(seq, fileIdx), ct, nil)
 }
 
 type shareTarget struct {
@@ -932,7 +935,7 @@ func runSend(args []string) {
 	}()
 
 	sendChunk := func(dc *webrtc.DataChannel, ch chan struct{}, seq uint32, plaintext []byte) error {
-		ct := encryptChunk(aead, plaintext, seq)
+		ct := encryptChunk(aead, plaintext, seq, 0) // CLI send is single-file (fileIdx 0)
 		out := make([]byte, seqHeaderBytes+len(ct))
 		binary.BigEndian.PutUint32(out[:seqHeaderBytes], seq)
 		copy(out[seqHeaderBytes:], ct)
@@ -1429,10 +1432,20 @@ func runRecv(args []string) {
 		lastReport    time.Time
 		lastReceived  int64
 		expectedHash  string
+		// Batch (multi-file) state
+		currentFileIdx = -1
+		fileCount      = 1
+		// Bandwidth probe (Phase E) state
+		probeActive bool
+		probeBytes  int64
+		probeT0     time.Time
+		probeTLast  time.Time
 	)
+	// Pending frames hold CIPHERTEXT: decrypting needs the fileIdx from meta
+	// (it's part of the IV), which isn't known before meta arrives.
 	type pendingChunk struct {
 		seq uint32
-		pt  []byte
+		ct  []byte
 	}
 	var pending []pendingChunk
 
@@ -1505,8 +1518,13 @@ func runRecv(args []string) {
 		fmt.Printf("Done: %s in %s (%.1f MB/s, E2E decrypted)%s\n",
 			formatBytes(metaSize), elapsed.Round(time.Millisecond), rate, verifyMsg)
 		if dc, ok := controlDC.Load().(*webrtc.DataChannel); ok && dc != nil {
-			ack, _ := json.Marshal(map[string]any{"type": "complete"})
+			ack, _ := json.Marshal(map[string]any{"type": "complete", "fileIdx": currentFileIdx})
 			_ = dc.SendText(string(ack))
+		}
+		if currentFileIdx < fileCount-1 {
+			// More batch files coming — stay alive and wait for the next meta.
+			fmt.Printf("File %d/%d received, waiting for next...\n", currentFileIdx+1, fileCount)
+			return
 		}
 		select {
 		case transferDone <- nil:
@@ -1566,6 +1584,9 @@ func runRecv(args []string) {
 			Reason          string `json:"reason"`
 			PrefixHash      string `json:"prefixHash"`
 			FileHash        string `json:"fileHash"`
+			FileIdx         int    `json:"fileIdx"`
+			FileCount       int    `json:"fileCount"`
+			Path            string `json:"path"`
 		}
 		if err := json.Unmarshal(msg.Data, &m); err != nil {
 			return
@@ -1574,10 +1595,47 @@ func runRecv(args []string) {
 		case "meta":
 			stMu.Lock()
 			defer stMu.Unlock()
-			if gotMeta {
+			mCount := m.FileCount
+			if mCount == 0 {
+				mCount = 1
+			}
+			if gotMeta && m.FileIdx == currentFileIdx {
+				// Duplicate meta (sender restarted after a reconnect): answer
+				// with our CURRENT bitmap so it skips chunks we already hold.
+				if dc, ok := controlDC.Load().(*webrtc.DataChannel); ok && dc != nil && recvBitmap != nil {
+					resume, _ := json.Marshal(map[string]any{
+						"type":    "resume",
+						"data":    b64URL.EncodeToString(recvBitmap),
+						"caps":    map[string]int{"probe": 1, "batch": 1},
+						"fileIdx": currentFileIdx,
+					})
+					_ = dc.SendText(string(resume))
+				}
 				return
 			}
+			if gotMeta {
+				// Next file of a batch: reset per-file state. Stragglers from
+				// the previous file were dropped by the finished/outFile guards.
+				if outFile != nil {
+					_ = outFile.Close()
+					outFile = nil
+				}
+				finished = false
+				pending = nil
+				expectedHash = ""
+				lastReceived = 0
+			}
+			currentFileIdx = m.FileIdx
+			fileCount = mCount
 			metaName = m.Name
+			// Folder transfers carry a relative path; only honor it when it
+			// can't escape the working directory (no "..", not absolute).
+			if m.Path != "" && filepath.IsLocal(filepath.FromSlash(m.Path)) {
+				metaName = filepath.FromSlash(m.Path)
+				if dir := filepath.Dir(metaName); dir != "." {
+					_ = os.MkdirAll(dir, 0o755)
+				}
+			}
 			metaSize = m.Size
 			metaChunkSize = m.ChunkSize
 			if metaChunkSize == 0 {
@@ -1627,36 +1685,73 @@ func runRecv(args []string) {
 			lastReport = startT
 			gotMeta = true
 
+			batchLabel := ""
+			if fileCount > 1 {
+				batchLabel = fmt.Sprintf(" [file %d/%d]", currentFileIdx+1, fileCount)
+			}
 			if alreadyHave > 0 {
-				fmt.Printf("Resuming %q (%d/%d chunks already on disk)\n", metaName, alreadyHave, metaChunks)
+				fmt.Printf("Resuming %q (%d/%d chunks already on disk)%s\n", metaName, alreadyHave, metaChunks, batchLabel)
 			} else {
-				fmt.Printf("Receiving %q (%s, %d chunks, v%d)\n", metaName, formatBytes(metaSize), metaChunks, m.ProtocolVersion)
+				fmt.Printf("Receiving %q (%s, %d chunks, v%d)%s\n", metaName, formatBytes(metaSize), metaChunks, m.ProtocolVersion, batchLabel)
 			}
 
 			// Send "resume" with our current bitmap so the sender can skip
 			// already-have seqs in Phase 1. Always send (even when fresh,
 			// empty bitmap) so the sender doesn't have to wait the full
-			// resume-wait timeout.
+			// resume-wait timeout. caps advertises probe/batch support.
 			if dc, ok := controlDC.Load().(*webrtc.DataChannel); ok && dc != nil {
 				resume, _ := json.Marshal(map[string]any{
-					"type": "resume",
-					"data": b64URL.EncodeToString(recvBitmap),
+					"type":    "resume",
+					"data":    b64URL.EncodeToString(recvBitmap),
+					"caps":    map[string]int{"probe": 1, "batch": 1},
+					"fileIdx": currentFileIdx,
 				})
 				_ = dc.SendText(string(resume))
 			}
 
 			for _, p := range pending {
-				storeChunk(p.seq, p.pt)
+				if pt, derr := decryptChunk(aead, p.ct, p.seq, uint32(currentFileIdx)); derr == nil {
+					storeChunk(p.seq, pt)
+				}
 			}
 			pending = nil
 			finishIfComplete()
 		case "done":
 			stMu.Lock()
-			if !finished {
+			if !finished && m.FileIdx == currentFileIdx {
 				expectedHash = m.FileHash
 			}
 			finishIfComplete()
 			stMu.Unlock()
+		case "probe-start":
+			stMu.Lock()
+			probeActive = true
+			probeBytes = 0
+			probeT0 = time.Time{}
+			probeTLast = time.Time{}
+			stMu.Unlock()
+		case "probe-end":
+			// Data DCs are unordered relative to control — give in-flight
+			// probe frames a moment to land before reporting.
+			go func() {
+				time.Sleep(150 * time.Millisecond)
+				stMu.Lock()
+				bytesGot := probeBytes
+				var durMs int64
+				if !probeT0.IsZero() && !probeTLast.IsZero() {
+					durMs = probeTLast.Sub(probeT0).Milliseconds()
+				}
+				probeActive = false
+				stMu.Unlock()
+				if dc, ok := controlDC.Load().(*webrtc.DataChannel); ok && dc != nil {
+					res, _ := json.Marshal(map[string]any{
+						"type":          "probe-result",
+						"bytesReceived": bytesGot,
+						"durationMs":    durMs,
+					})
+					_ = dc.SendText(string(res))
+				}
+			}()
 		case "abort":
 			select {
 			case transferDone <- fmt.Errorf("sender aborted: %s", m.Reason):
@@ -1675,16 +1770,35 @@ func runRecv(args []string) {
 		}
 		seq := binary.BigEndian.Uint32(msg.Data[:seqHeaderBytes])
 		ct := msg.Data[seqHeaderBytes:]
-		pt, err := decryptChunk(aead, ct, seq)
+		// Bandwidth-probe dummies: count bytes, never decrypt or store.
+		if seq >= probeSeqBase {
+			stMu.Lock()
+			if probeActive {
+				now := time.Now()
+				if probeT0.IsZero() {
+					probeT0 = now
+				}
+				probeTLast = now
+				probeBytes += int64(len(msg.Data))
+			}
+			stMu.Unlock()
+			return
+		}
+		stMu.Lock()
+		if !gotMeta {
+			ctCopy := append([]byte(nil), ct...)
+			pending = append(pending, pendingChunk{seq: seq, ct: ctCopy})
+			stMu.Unlock()
+			return
+		}
+		fIdx := uint32(currentFileIdx)
+		stMu.Unlock()
+		pt, err := decryptChunk(aead, ct, seq, fIdx)
 		if err != nil {
 			return
 		}
 		stMu.Lock()
 		defer stMu.Unlock()
-		if !gotMeta {
-			pending = append(pending, pendingChunk{seq: seq, pt: pt})
-			return
-		}
 		if !storeChunk(seq, pt) {
 			return
 		}
@@ -1745,11 +1859,13 @@ func runRecv(args []string) {
 		var version int64
 		for range ticker.C {
 			stMu.Lock()
-			if finished {
+			if finished && currentFileIdx >= fileCount-1 {
 				stMu.Unlock()
-				return
+				return // whole batch done
 			}
-			if recvBitmap == nil {
+			if recvBitmap == nil || finished {
+				// finished mid-batch: pause reporting until the next meta
+				// resets per-file state.
 				stMu.Unlock()
 				continue
 			}
@@ -1759,6 +1875,7 @@ func runRecv(args []string) {
 				"version":  version,
 				"received": receivedCount,
 				"data":     b64URL.EncodeToString(recvBitmap),
+				"fileIdx":  currentFileIdx,
 			})
 			stMu.Unlock()
 			if dc, ok := controlDC.Load().(*webrtc.DataChannel); ok && dc != nil {
