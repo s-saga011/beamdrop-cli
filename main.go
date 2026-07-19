@@ -41,6 +41,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"math/bits"
 	"net/http"
 	"net/url"
@@ -60,7 +61,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.5.0"
+var Version = "v0.6.0"
 
 const (
 	chunkSize           = 16 * 1024
@@ -80,7 +81,25 @@ const (
 	stagnantPassThreshold = 12   // ~3s of "no progress" passes before bailing
 	relayInflightWindow = 1000 // chunks (16MB) — relay-only cap, since pion bufferedAmount under-reports on TCP/TLS
 
-	// Phase 0 probe + adaptive throttle params
+	// Phase E/F: sender-side bandwidth probe + congestion control (datagram
+	// path only — reliable/relay DCs already have SCTP's own CC).
+	probeDurationMS  = 1200
+	probeMinFileSize = 12 * 1024 * 1024
+	probeResultWait  = 10 * time.Second // CPU-bound receivers answer late (event-queue backlog)
+	probeRateFactor  = 0.8
+	ccTickInterval   = 500 * time.Millisecond
+	ccLossWindowNear = 1000 // ms — ignore chunks sent more recently (acks in flight)
+	ccLossWindowFar  = 3000 // ms — ...and older than this (already judged)
+	ccMinSample      = 20
+	ccMinRate        = 256 * 1024.0
+	ccMaxRate        = 500 * 1024 * 1024.0
+	// Slow start: the probe measures the NETWORK (probe frames skip
+	// decrypt/store), but a phone receiver's CPU may absorb far less. Start
+	// low and grow fast while clean — overshooting at t=0 builds a receive
+	// backlog that poisons the whole transfer.
+	ccInitialCap      = 8 * 1024 * 1024.0
+	ccSlowStartGrowth = 1.6
+
 	resumeWaitTimeout   = 1500 * time.Millisecond
 	protocolVersion     = 3
 	defaultServer       = "https://p2p.draft-publish.com"
@@ -478,6 +497,69 @@ func ptr[T any](v T) *T { return &v }
 // Sender
 // ============================================================================
 
+// ccState is the shared token bucket the Phase-1 workers drain. Without it
+// the sender pushes at local-SCTP speed into a datagram channel, which on a
+// receiver slower than the path (phones) loses most of Phase 1 outright and
+// then crawls through a huge reliable-DC retransmit tail — the observed
+// "starts at 26MB/s, finishes at 4MB/s" pattern. The probe seeds the rate;
+// the AIMD loop tracks the receiver's bitmap from there.
+type ccState struct {
+	mu      sync.Mutex
+	enabled bool
+	rate    float64 // bytes/sec
+	tokens  float64
+	last    time.Time
+}
+
+func newCC(enabled bool) *ccState {
+	return &ccState{enabled: enabled, rate: ccMaxRate, last: time.Now()}
+}
+
+func (c *ccState) getRate() float64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.rate
+}
+
+func (c *ccState) setRate(r float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rate = math.Min(ccMaxRate, math.Max(ccMinRate, r))
+}
+
+func (c *ccState) refillLocked(now time.Time) {
+	c.tokens = math.Min(c.rate*0.5, c.tokens+now.Sub(c.last).Seconds()*c.rate)
+	c.last = now
+}
+
+// consume charges n bytes and sleeps while the bucket is in deficit. At
+// ccMaxRate the bucket never runs dry, so the disabled/uncapped cost is two
+// arithmetic ops per chunk.
+func (c *ccState) consume(n int, abortSig <-chan struct{}) {
+	if !c.enabled {
+		return
+	}
+	c.mu.Lock()
+	c.refillLocked(time.Now())
+	c.tokens -= float64(n)
+	deficit := -c.tokens
+	rate := c.rate
+	c.mu.Unlock()
+	for deficit > 0 {
+		wait := time.Duration(math.Min(0.25, math.Max(0.005, deficit/rate)) * float64(time.Second))
+		select {
+		case <-abortSig:
+			return
+		case <-time.After(wait):
+		}
+		c.mu.Lock()
+		c.refillLocked(time.Now())
+		deficit = -c.tokens
+		rate = c.rate
+		c.mu.Unlock()
+	}
+}
+
 func runSend(args []string) {
 	checkForUpdate()
 	fl := parseFlags(args)
@@ -667,28 +749,39 @@ func runSend(args []string) {
 		recvBitmapMu  sync.Mutex
 		recvBitmap    []byte
 		recvBitmapVer int64
+		drainRate     float64 // EWMA of receiver absorption, bytes/sec (guarded by recvBitmapMu)
+		lastAckTime   time.Time
+		lastAckCount  int
 	)
 	var transferComplete atomic.Bool
 	var bytesPushed atomic.Int64
 
 	resumeBitmapCh := make(chan []byte, 1)
 	var resumeDelivered atomic.Bool
+	var peerProbeCap atomic.Bool
+	probeResultCh := make(chan [2]int64, 1) // {bytesReceived, durationMs}
 
 	controlDC.OnMessage(func(msg webrtc.DataChannelMessage) {
 		if !msg.IsString {
 			return
 		}
 		var m struct {
-			Type     string `json:"type"`
-			Version  int64  `json:"version"`
-			Received int    `json:"received"`
-			Data     string `json:"data"`
+			Type          string         `json:"type"`
+			Version       int64          `json:"version"`
+			Received      int            `json:"received"`
+			Data          string         `json:"data"`
+			Caps          map[string]int `json:"caps"`
+			BytesReceived int64          `json:"bytesReceived"`
+			DurationMs    int64          `json:"durationMs"`
 		}
 		if err := json.Unmarshal(msg.Data, &m); err != nil {
 			return
 		}
 		switch m.Type {
 		case "resume":
+			if m.Caps["probe"] == 1 {
+				peerProbeCap.Store(true)
+			}
 			if resumeDelivered.Swap(true) {
 				return
 			}
@@ -698,6 +791,11 @@ func runSend(args []string) {
 			}
 			select {
 			case resumeBitmapCh <- bm:
+			default:
+			}
+		case "probe-result":
+			select {
+			case probeResultCh <- [2]int64{m.BytesReceived, m.DurationMs}:
 			default:
 			}
 		case "bitmap":
@@ -712,6 +810,25 @@ func runSend(args []string) {
 			}
 			recvBitmap = bm
 			recvBitmapVer = m.Version
+			// Observed absorption rate: bytes newly acked per second between
+			// bitmap updates. This is the receiver telling us exactly how
+			// fast it can actually drink — the congestion controller clamps
+			// to it instead of hunting for it.
+			acked := countSetBits(bm)
+			now := time.Now()
+			if !lastAckTime.IsZero() {
+				dt := now.Sub(lastAckTime).Seconds()
+				if dt > 0.05 && acked > lastAckCount {
+					inst := float64(acked-lastAckCount) * chunkSize / dt
+					if drainRate == 0 {
+						drainRate = inst
+					} else {
+						drainRate = drainRate*0.7 + inst*0.3
+					}
+				}
+			}
+			lastAckTime = now
+			lastAckCount = acked
 			// Treat a fully-set bitmap as proof of completion. The
 			// receiver's explicit {type:"complete"} can be delayed by
 			// OPFS finalize (worker write queue drain on slow NAND) or
@@ -838,6 +955,59 @@ func runSend(args []string) {
 		// Fresh transfer (receiver doesn't support resume or has nothing).
 	}
 
+	// ===== Phase E: bandwidth probe (datagram path only) =====
+	// Blast dummy frames for ~1.2s, let the receiver count what actually
+	// arrives, and start Phase 1 at 80% of that. Only when the receiver
+	// advertised caps.probe (old clients would choke on the reserved seqs)
+	// and the file is big enough for the probe to pay for itself.
+	cc := newCC(!fl.relay)
+	sendTimes := make([]int64, expectedChunks) // unix ms of last send per seq (atomic)
+	if cc.enabled && peerProbeCap.Load() && totalBytes >= probeMinFileSize {
+		ps, _ := json.Marshal(map[string]any{"type": "probe-start", "durationMs": probeDurationMS})
+		_ = controlDC.SendText(string(ps))
+		deadline := time.Now().Add(probeDurationMS * time.Millisecond)
+		var pseq atomic.Uint32
+		var pwg sync.WaitGroup
+		for i := range dataDCs {
+			pwg.Add(1)
+			go func(dc *webrtc.DataChannel, ch chan struct{}) {
+				defer pwg.Done()
+				buf := make([]byte, seqHeaderBytes+chunkSize)
+				_, _ = rand.Read(buf[seqHeaderBytes : seqHeaderBytes+4096])
+				for time.Now().Before(deadline) {
+					for dc.BufferedAmount() > bufferedHigh {
+						select {
+						case <-ch:
+						case <-time.After(100 * time.Millisecond):
+						}
+						if !time.Now().Before(deadline) {
+							return
+						}
+					}
+					binary.BigEndian.PutUint32(buf[:seqHeaderBytes], probeSeqBase+(pseq.Add(1)&0xffff))
+					if dc.Send(buf) != nil {
+						return
+					}
+				}
+			}(dataDCs[i], bufLow[i])
+		}
+		pwg.Wait()
+		pe, _ := json.Marshal(map[string]any{"type": "probe-end"})
+		_ = controlDC.SendText(string(pe))
+		select {
+		case r := <-probeResultCh:
+			if r[0] > 0 && r[1] > 0 {
+				measured := float64(r[0]) / float64(r[1]) * 1000
+				cc.setRate(math.Min(measured*probeRateFactor, ccInitialCap))
+				fmt.Printf("Probe: %s/s measured → starting at %s/s (slow start)\n",
+					formatBytes(int64(measured)), formatBytes(int64(cc.getRate())))
+			}
+		case <-time.After(probeResultWait):
+			cc.setRate(ccInitialCap)
+			fmt.Println("Probe: no result — starting at slow-start cap")
+		}
+	}
+
 	sendStart := time.Now()
 	var lastReportMu sync.Mutex
 	lastReport := sendStart
@@ -934,6 +1104,134 @@ func runSend(args []string) {
 		}
 	}()
 
+	// ===== Phase F: AIMD on loss measured from the receiver's bitmap =====
+	// A chunk sent 1–3s ago that still isn't in the bitmap is presumed lost.
+	// <1% loss → rate ×1.1; >5% → ×0.8, with the non-congestive-loss guard:
+	// 3 straight cuts that don't improve loss mean the loss is ambient
+	// (radio / random), so hold instead of death-spiraling to the floor.
+	if cc.enabled {
+		go func() {
+			ticker := time.NewTicker(ccTickInterval)
+			defer ticker.Stop()
+			decreaseStreak, holdTicks := 0, 0
+			streakStartLoss := 0.0
+			var lastVer int64 = -1
+			stallTicks := 0
+			slowStart := true
+			for {
+				select {
+				case <-abortSig:
+					return
+				case <-ticker.C:
+				}
+				if transferComplete.Load() {
+					return
+				}
+				recvBitmapMu.Lock()
+				rb := recvBitmap
+				ver := recvBitmapVer
+				drain := drainRate
+				recvBitmapMu.Unlock()
+				if rb == nil {
+					continue
+				}
+				// Frozen bitmap = the receiver's event loop is clogged and
+				// can't even report. Judging loss against it would read 100%
+				// and death-spiral; blasting on unchanged would drown the
+				// receiver further. Do what TCP does on a zero window: back
+				// off boundedly until it shows signs of life.
+				if ver == lastVer {
+					stallTicks++
+					// The receiver stopped reporting — it is busy draining a
+					// backlog, not gone. Drop ONCE to just under its observed
+					// absorption so the backlog shrinks, and only decay
+					// further if the silence drags on (5s+).
+					if stallTicks == 2 || (stallTicks > 10 && stallTicks%4 == 0) {
+						before := cc.getRate()
+						target := before * 0.5
+						if drain > 0 {
+							target = math.Max(drain*0.6, ccMinRate)
+						}
+						if target < before {
+							cc.setRate(target)
+							fmt.Fprintf(os.Stderr, "[cc] receiver quiet (no bitmap %.1fs, drain %.1f) rate %.1f → %.1f MB/s\n",
+								float64(stallTicks)*ccTickInterval.Seconds(), drain/1048576, before/1048576, cc.getRate()/1048576)
+						}
+					}
+					continue
+				}
+				lastVer = ver
+				stallTicks = 0
+				nowMS := time.Now().UnixMilli()
+				sampled, lost := 0, 0
+				for s := 0; s < expectedChunks; s++ {
+					ts := atomic.LoadInt64(&sendTimes[s])
+					if ts == 0 || ts > nowMS-ccLossWindowNear || ts < nowMS-ccLossWindowFar {
+						continue
+					}
+					sampled++
+					if !getBit(rb, s) {
+						lost++
+					}
+				}
+				if sampled < ccMinSample {
+					continue
+				}
+				loss := float64(lost) / float64(sampled)
+				before := cc.getRate()
+				switch {
+				case loss < 0.01:
+					if slowStart {
+						cc.setRate(before * ccSlowStartGrowth)
+					} else {
+						cc.setRate(before * 1.1)
+					}
+					decreaseStreak = 0
+				case loss > 0.5:
+					slowStart = false
+					// Majority loss is never ambient radio noise — we are far
+					// above capacity (e.g. probe failed and we started
+					// uncapped). Halve without engaging the ambient-loss
+					// guard so we reach a sane rate in a few ticks.
+					cc.setRate(before * 0.5)
+					decreaseStreak = 0
+					holdTicks = 0
+				case loss > 0.05:
+					slowStart = false
+					improving := decreaseStreak == 0 || loss < streakStartLoss*0.85
+					if improving || decreaseStreak < 3 {
+						if decreaseStreak == 0 || improving {
+							streakStartLoss = loss
+						}
+						cc.setRate(before * 0.8)
+						decreaseStreak++
+						holdTicks = 0
+					} else {
+						holdTicks++
+						if holdTicks%4 == 0 {
+							cc.setRate(before * 1.05)
+						}
+					}
+				default:
+					decreaseStreak = 0
+				}
+				// While we are losing chunks, never run faster than what the
+				// receiver demonstrably absorbs (×1.2 headroom). This snaps
+				// the rate to the true capacity in one tick instead of
+				// stepping down through many multiplicative cuts.
+				if loss > 0.05 && drain > 0 {
+					if limit := drain * 1.2; cc.getRate() > limit {
+						cc.setRate(limit)
+					}
+				}
+				if after := cc.getRate(); after != before {
+					fmt.Fprintf(os.Stderr, "[cc] loss %.1f%% (%d/%d) drain %.1f rate %.1f → %.1f MB/s\n",
+						loss*100, lost, sampled, drain/1048576, before/1048576, after/1048576)
+				}
+			}
+		}()
+	}
+
 	sendChunk := func(dc *webrtc.DataChannel, ch chan struct{}, seq uint32, plaintext []byte) error {
 		ct := encryptChunk(aead, plaintext, seq, 0) // CLI send is single-file (fileIdx 0)
 		out := make([]byte, seqHeaderBytes+len(ct))
@@ -952,6 +1250,11 @@ func runSend(args []string) {
 		}
 		if err := dc.Send(out); err != nil {
 			return err
+		}
+		if int(seq) < len(sendTimes) {
+			// Retransmits refresh the timestamp too, so a chunk re-sent on the
+			// reliable DC isn't blamed as "lost" from its original send time.
+			atomic.StoreInt64(&sendTimes[seq], time.Now().UnixMilli())
 		}
 		bytesPushed.Add(int64(len(plaintext)))
 
@@ -1120,6 +1423,7 @@ func runSend(args []string) {
 					return
 				}
 				waitInflight(cd.seq)
+				cc.consume(len(cd.pt), abortSig) // Phase F pacing (no-op on relay)
 				if err := sendChunk(dc, ch, cd.seq, cd.pt); err != nil {
 					return
 				}
