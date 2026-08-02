@@ -61,7 +61,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.6.0"
+var Version = "v0.7.0"
 
 const (
 	chunkSize           = 16 * 1024
@@ -103,7 +103,8 @@ const (
 	resumeWaitTimeout   = 1500 * time.Millisecond
 	protocolVersion     = 3
 	defaultServer       = "https://p2p.draft-publish.com"
-	stallTimeout        = 30 * time.Second // abort send if bytesPushed doesn't move for this long
+	stallTimeout        = 30 * time.Second // stalled this long → try ICE restart (VPN/network change)
+	stallHardTimeout    = 3 * time.Minute  // stalled this long → give up for real
 	statsInterval       = 2 * time.Second  // sender->server stats cadence
 )
 
@@ -283,13 +284,28 @@ func toWSURL(server, room string) (string, error) {
 	return fmt.Sprintf("%s://%s/ws/%s", scheme, u.Host, room), nil
 }
 
-func dialSignaling(server, room string) (*websocket.Conn, error) {
+// newPeerToken returns a stable per-process token. Reconnecting the
+// signaling socket with the same token keeps our peerId server-side, so the
+// other party sees no join/left churn across network changes.
+func newPeerToken() string {
+	b := make([]byte, 12)
+	_, _ = rand.Read(b)
+	return b64URL.EncodeToString(b)
+}
+
+func dialSignaling(server, room, peerToken string) (*safeWS, error) {
 	wsURL, err := toWSURL(server, room)
 	if err != nil {
 		return nil, err
 	}
+	if peerToken != "" {
+		wsURL += "?peer=" + peerToken
+	}
 	c, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	return c, err
+	if err != nil {
+		return nil, err
+	}
+	return &safeWS{conn: c, url: wsURL}, nil
 }
 
 func createRoom(server string) (string, error) {
@@ -354,13 +370,18 @@ func fetchICE(server string) ([]webrtc.ICEServer, error) {
 // safeWS wraps a *websocket.Conn with a mutex; gorilla/websocket forbids
 // concurrent writers and pion ICE callbacks fire on background goroutines.
 type safeWS struct {
-	conn *websocket.Conn
-	mu   sync.Mutex
+	conn   *websocket.Conn
+	mu     sync.Mutex
+	url    string
+	closed atomic.Bool
 }
 
 func (s *safeWS) write(m sigMsg) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.conn == nil {
+		return fmt.Errorf("signaling disconnected")
+	}
 	return s.conn.WriteJSON(m)
 }
 
@@ -369,7 +390,62 @@ func (s *safeWS) write(m sigMsg) error {
 func (s *safeWS) writeRaw(b []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.conn == nil {
+		return fmt.Errorf("signaling disconnected")
+	}
 	return s.conn.WriteMessage(websocket.TextMessage, b)
+}
+
+func (s *safeWS) readJSON(v any) error {
+	s.mu.Lock()
+	c := s.conn
+	s.mu.Unlock()
+	if c == nil {
+		return fmt.Errorf("signaling disconnected")
+	}
+	return c.ReadJSON(v)
+}
+
+func (s *safeWS) close() {
+	s.closed.Store(true)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn != nil {
+		_ = s.conn.Close()
+	}
+}
+
+// reconnectWithBackoff re-dials the same URL (same ?peer= token → same
+// peerId server-side). Returns false once the caller closed us or the
+// retry budget is spent. VPN toggles and sleep/wake land here.
+func (s *safeWS) reconnectWithBackoff(giveUp func() bool) bool {
+	for attempt := 1; attempt <= 20; attempt++ {
+		if s.closed.Load() || (giveUp != nil && giveUp()) {
+			return false
+		}
+		delay := time.Duration(1<<uint(min(attempt-1, 4))) * time.Second // 1,2,4,8,16,16...
+		if delay > 10*time.Second {
+			delay = 10 * time.Second
+		}
+		time.Sleep(delay)
+		if s.closed.Load() || (giveUp != nil && giveUp()) {
+			return false
+		}
+		c, _, err := websocket.DefaultDialer.Dial(s.url, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[ws] reconnect attempt %d failed: %v\n", attempt, err)
+			continue
+		}
+		s.mu.Lock()
+		if s.conn != nil {
+			_ = s.conn.Close()
+		}
+		s.conn = c
+		s.mu.Unlock()
+		fmt.Fprintf(os.Stderr, "[ws] reconnected (attempt %d)\n", attempt)
+		return true
+	}
+	return false
 }
 
 // ============================================================================
@@ -627,12 +703,11 @@ func runSend(args []string) {
 		fmt.Println("Relay mode: forcing all traffic through TURN over TLS:443")
 	}
 
-	wsConn, err := dialSignaling(server, room)
+	ws, err := dialSignaling(server, room, newPeerToken())
 	if err != nil {
 		die(fmt.Errorf("dial signaling: %w", err))
 	}
-	defer wsConn.Close()
-	ws := &safeWS{conn: wsConn}
+	defer ws.close()
 
 	// In --relay mode use a single PC. Allocating four parallel TURN
 	// allocations over TLS:443 from the same mobile IP appears to hit
@@ -656,6 +731,8 @@ func runSend(args []string) {
 	}
 
 	var remotePeerID atomic.Value
+	everConnected := make([]atomic.Bool, effectivePCs)
+	iceRestartReq := make(chan int, effectivePCs*2)
 
 	for i, pc := range pcs {
 		idx := i
@@ -677,6 +754,18 @@ func runSend(args []string) {
 		})
 		pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 			fmt.Fprintf(os.Stderr, "[pc%d] PC state: %s\n", idx, s.String())
+			if s == webrtc.PeerConnectionStateConnected {
+				everConnected[idx].Store(true)
+			}
+			// A network change (VPN off, Wi-Fi switch) lands here. The DCs
+			// survive the stall, so a successful ICE restart resumes the
+			// transfer where it left off.
+			if (s == webrtc.PeerConnectionStateDisconnected || s == webrtc.PeerConnectionStateFailed) && everConnected[idx].Load() {
+				select {
+				case iceRestartReq <- idx:
+				default:
+				}
+			}
 		})
 	}
 
@@ -846,9 +935,19 @@ func runSend(args []string) {
 	go func() {
 		for {
 			var msg sigMsg
-			if err := wsConn.ReadJSON(&msg); err != nil {
+			if err := ws.readJSON(&msg); err != nil {
+				// Signaling drop ≠ transfer failure: data flows P2P. Re-dial
+				// with the same peer token (VPN toggle, sleep/wake, server
+				// bounce) and keep going; die only when retries are spent.
+				if transferComplete.Load() || ws.closed.Load() {
+					return
+				}
+				fmt.Fprintf(os.Stderr, "[ws] signaling lost: %v — reconnecting\n", err)
+				if ws.reconnectWithBackoff(func() bool { return transferComplete.Load() }) {
+					continue
+				}
 				select {
-				case wsErr <- err:
+				case wsErr <- fmt.Errorf("signaling reconnect failed: %w", err):
 				default:
 				}
 				return
@@ -1026,14 +1125,72 @@ func runSend(args []string) {
 		})
 	}
 
-	// Stall watchdog: if bytesPushed doesn't move for stallTimeout, give up.
-	// This catches the case where pion's SCTP buffer wedges (e.g. mobile
-	// receiver Wi-Fi went idle) so we don't hang the user's terminal forever.
+	// ICE-restart worker: renegotiates a PC after a network change. Offers
+	// are retried because the receiver's own signaling may be mid-reconnect.
+	restartInFlight := make([]atomic.Bool, effectivePCs)
+	go func() {
+		for {
+			var idx int
+			select {
+			case <-abortSig:
+				return
+			case idx = <-iceRestartReq:
+			}
+			if transferComplete.Load() {
+				return
+			}
+			if !restartInFlight[idx].CompareAndSwap(false, true) {
+				continue // already being restarted
+			}
+			go func(pcIdx int) {
+				defer restartInFlight[pcIdx].Store(false)
+				pc := pcs[pcIdx]
+				forceFirst := os.Getenv("BEAMDROP_TEST_ICERESTART") == "1"
+				for attempt := 1; attempt <= 20; attempt++ {
+					if transferComplete.Load() {
+						return
+					}
+					st := pc.ConnectionState()
+					if st == webrtc.PeerConnectionStateClosed {
+						return
+					}
+					if st == webrtc.PeerConnectionStateConnected && !(forceFirst && attempt == 1) {
+						return
+					}
+					offer, oerr := pc.CreateOffer(&webrtc.OfferOptions{ICERestart: true})
+					if oerr == nil && pc.SetLocalDescription(offer) == nil {
+						rid, _ := remotePeerID.Load().(string)
+						if rid != "" && ws.write(sigMsg{Type: "offer", To: rid, SDP: pc.LocalDescription(), PcIdx: ptr(pcIdx)}) == nil {
+							fmt.Fprintf(os.Stderr, "[pc%d] ICE restart offer sent (attempt %d)\n", pcIdx, attempt)
+						} else {
+							fmt.Fprintf(os.Stderr, "[pc%d] ICE restart waiting for signaling (attempt %d)\n", pcIdx, attempt)
+						}
+					} else if oerr != nil {
+						fmt.Fprintf(os.Stderr, "[pc%d] ICE restart offer failed: %v\n", pcIdx, oerr)
+					}
+					select {
+					case <-abortSig:
+						return
+					case <-time.After(3 * time.Second):
+					}
+					if pc.ConnectionState() == webrtc.PeerConnectionStateConnected {
+						fmt.Fprintf(os.Stderr, "[pc%d] ICE restart succeeded\n", pcIdx)
+						return
+					}
+				}
+			}(idx)
+		}
+	}()
+
+	// Stall watchdog: 30s without progress → kick ICE restarts on every PC
+	// (VPN toggles often surface as a silent stall before any state change
+	// fires). Only give up after stallHardTimeout of continued silence.
 	go func() {
 		var last int64 = -1
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		stalledSince := time.Time{}
+		restartKicked := false
 		for {
 			select {
 			case <-abortSig:
@@ -1047,12 +1204,27 @@ func runSend(args []string) {
 			if cur == last && cur > 0 {
 				if stalledSince.IsZero() {
 					stalledSince = time.Now()
-				} else if time.Since(stalledSince) >= stallTimeout {
-					abort(fmt.Sprintf("no progress for %s", stallTimeout))
+				}
+				d := time.Since(stalledSince)
+				if d >= stallTimeout {
+					if !restartKicked {
+						fmt.Fprintf(os.Stderr, "\n[stall] no progress for %s — attempting to re-establish the connection (network change?)\n", stallTimeout)
+						restartKicked = true
+					}
+					for i := 0; i < effectivePCs; i++ {
+						select {
+						case iceRestartReq <- i:
+						default:
+						}
+					}
+				}
+				if d >= stallHardTimeout {
+					abort(fmt.Sprintf("no progress for %s despite reconnect attempts", stallHardTimeout))
 					return
 				}
 			} else {
 				stalledSince = time.Time{}
+				restartKicked = false
 			}
 			last = cur
 		}
@@ -1410,6 +1582,23 @@ func runSend(args []string) {
 			}
 		}
 	}
+	// Test hook: BEAMDROP_TEST_ICERESTART=1 forces an ICE restart on every
+	// PC 3s into the transfer, to exercise the renegotiation path without
+	// physically changing networks.
+	if os.Getenv("BEAMDROP_TEST_ICERESTART") == "1" {
+		go func() {
+			time.Sleep(3 * time.Second)
+			fmt.Fprintln(os.Stderr, "[test] forcing ICE restart on all PCs")
+			for i := 0; i < effectivePCs; i++ {
+				everConnected[i].Store(true)
+				select {
+				case iceRestartReq <- i:
+				default:
+				}
+			}
+		}()
+	}
+
 	var wg sync.WaitGroup
 	for i := 0; i < effectivePCs; i++ {
 		wg.Add(1)
@@ -1699,12 +1888,11 @@ func runRecv(args []string) {
 		fmt.Println("Relay mode: forcing all traffic through TURN over TLS:443")
 	}
 
-	wsConn, err := dialSignaling(server, room)
+	ws, err := dialSignaling(server, room, newPeerToken())
 	if err != nil {
 		die(fmt.Errorf("dial signaling: %w", err))
 	}
-	defer wsConn.Close()
-	ws := &safeWS{conn: wsConn}
+	defer ws.close()
 
 	pcs := make([]*webrtc.PeerConnection, numPCs)
 	var pcsMu sync.Mutex
@@ -2191,7 +2379,20 @@ func runRecv(args []string) {
 	go func() {
 		for {
 			var msg sigMsg
-			if err := wsConn.ReadJSON(&msg); err != nil {
+			if err := ws.readJSON(&msg); err != nil {
+				if ws.closed.Load() {
+					return
+				}
+				stMu.Lock()
+				done := finished && currentFileIdx >= fileCount-1
+				stMu.Unlock()
+				if done {
+					return
+				}
+				fmt.Fprintf(os.Stderr, "[ws] signaling lost: %v — reconnecting\n", err)
+				if ws.reconnectWithBackoff(nil) {
+					continue
+				}
 				return
 			}
 			idx := 0
