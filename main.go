@@ -61,7 +61,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.7.2"
+var Version = "v0.8.0"
 
 const (
 	chunkSize           = 16 * 1024
@@ -261,6 +261,7 @@ func hashFileFull(path string) (string, error) {
 // ============================================================================
 
 type sigMsg struct {
+	Caps map[string]int64 `json:"caps,omitempty"`
 	Type      string                     `json:"type"`
 	From      string                     `json:"from,omitempty"`
 	To        string                     `json:"to,omitempty"`
@@ -501,9 +502,10 @@ func die(err error) {
 
 // flags is the parsed result of parseFlags.
 type flags struct {
-	server string
-	relay  bool
-	pos    []string
+	server    string
+	relay     bool
+	chunkSize int64
+	pos       []string
 }
 
 func parseFlags(args []string) flags {
@@ -518,6 +520,13 @@ func parseFlags(args []string) flags {
 			}
 		case "--relay":
 			out.relay = true
+		case "--chunk":
+			i++
+			if i < len(args) {
+				if v, err := strconv.ParseInt(args[i], 10, 64); err == nil {
+					out.chunkSize = v
+				}
+			}
 		default:
 			out.pos = append(out.pos, a)
 		}
@@ -645,12 +654,29 @@ func runSend(args []string) {
 	server := fl.server
 	path := fl.pos[0]
 
+	// Experimental: --chunk lets us trade per-message overhead against
+	// datagram loss amplification. Safari's SCTP maxMessageSize is 65536,
+	// so cap plaintext at 48KB (48K + 4B seq + 16B tag < 64K).
+	sendChunkSize := int64(chunkSize)
+	if fl.chunkSize > 0 {
+		sendChunkSize = fl.chunkSize
+		if sendChunkSize < 4*1024 {
+			sendChunkSize = 4 * 1024
+		}
+		if sendChunkSize > 48*1024 {
+			sendChunkSize = 48 * 1024
+		}
+		if sendChunkSize != fl.chunkSize {
+			fmt.Fprintf(os.Stderr, "--chunk clamped to %d\n", sendChunkSize)
+		}
+	}
+
 	stat, err := os.Stat(path)
 	if err != nil {
 		die(err)
 	}
 	totalBytes := stat.Size()
-	expectedChunks := int((totalBytes + chunkSize - 1) / chunkSize)
+	expectedChunks := int((totalBytes + sendChunkSize - 1) / sendChunkSize)
 	if expectedChunks == 0 {
 		expectedChunks = 1
 	}
@@ -731,6 +757,7 @@ func runSend(args []string) {
 	}
 
 	var remotePeerID atomic.Value
+	var peerChunkHint atomic.Int64 // receiver's preferred chunk size (WS "hello")
 	everConnected := make([]atomic.Bool, effectivePCs)
 	iceRestartReq := make(chan int, effectivePCs*2)
 
@@ -908,7 +935,7 @@ func runSend(args []string) {
 			if !lastAckTime.IsZero() {
 				dt := now.Sub(lastAckTime).Seconds()
 				if dt > 0.05 && acked > lastAckCount {
-					inst := float64(acked-lastAckCount) * chunkSize / dt
+					inst := float64(acked-lastAckCount) * float64(sendChunkSize) / dt
 					if drainRate == 0 {
 						drainRate = inst
 					} else {
@@ -962,6 +989,13 @@ func runSend(args []string) {
 			fmt.Fprintf(os.Stderr, "[ws] recv type=%s peer=%s pcIdx=%d\n", msg.Type, msg.PeerID, idx)
 			switch msg.Type {
 			case "joined":
+			case "hello":
+				// Receiver capability advertisement — arrives during ICE
+				// setup, well before we build the meta.
+				if h, ok := msg.Caps["chunkHint"]; ok && h >= 4096 && h <= 48*1024 {
+					peerChunkHint.Store(h)
+					fmt.Fprintf(os.Stderr, "[ws] receiver chunk hint: %d\n", h)
+				}
 			case "peer-joined":
 				fmt.Fprintf(os.Stderr, "[ws] peer-joined → creating offer for %d pc(s)\n", len(pcs))
 				remotePeerID.Store(msg.PeerID)
@@ -1025,13 +1059,25 @@ func runSend(args []string) {
 	}
 	fmt.Println("Connected, starting transfer.")
 
+	// Adopt the receiver's chunk-size hint (WebKit receivers ask for bigger
+	// chunks — their per-message delivery cost dominates; +39% on iPad).
+	// An explicit --chunk wins; relay keeps the default (reliable path).
+	if h := peerChunkHint.Load(); h > 0 && fl.chunkSize == 0 && !fl.relay {
+		sendChunkSize = h
+		expectedChunks = int((totalBytes + sendChunkSize - 1) / sendChunkSize)
+		if expectedChunks == 0 {
+			expectedChunks = 1
+		}
+		fmt.Printf("Using %dKB chunks (receiver hint)\n", sendChunkSize/1024)
+	}
+
 	mime := "application/octet-stream"
 	metaJSON, _ := json.Marshal(map[string]any{
 		"type":            "meta",
 		"name":            filepath.Base(path),
 		"size":            totalBytes,
 		"mime":            mime,
-		"chunkSize":       chunkSize,
+		"chunkSize":       sendChunkSize,
 		"totalChunks":     expectedChunks,
 		"protocolVersion": protocolVersion,
 		"prefixHash":      prefixHash,
@@ -1071,7 +1117,7 @@ func runSend(args []string) {
 			pwg.Add(1)
 			go func(dc *webrtc.DataChannel, ch chan struct{}) {
 				defer pwg.Done()
-				buf := make([]byte, seqHeaderBytes+chunkSize)
+				buf := make([]byte, seqHeaderBytes+int(sendChunkSize))
 				_, _ = rand.Read(buf[seqHeaderBytes : seqHeaderBytes+4096])
 				for time.Now().Before(deadline) {
 					for dc.BufferedAmount() > bufferedHigh {
@@ -1469,7 +1515,7 @@ func runSend(args []string) {
 			var pct float64
 			if rb != nil {
 				acked := int64(countSetBits(rb))
-				ackedBytes = acked * chunkSize
+				ackedBytes = acked * sendChunkSize
 				if ackedBytes > totalBytes {
 					ackedBytes = totalBytes
 				}
@@ -1533,7 +1579,7 @@ func runSend(args []string) {
 		}
 		defer f.Close()
 		hasher := sha256.New()
-		buf := make([]byte, chunkSize)
+		buf := make([]byte, sendChunkSize)
 		seq := uint32(0)
 		for {
 			if transferComplete.Load() {
@@ -1789,8 +1835,8 @@ func runSend(args []string) {
 			if transferComplete.Load() {
 				break
 			}
-			offset := int64(s) * chunkSize
-			size := int64(chunkSize)
+			offset := int64(s) * sendChunkSize
+			size := sendChunkSize
 			if offset+size > totalBytes {
 				size = totalBytes - offset
 			}
