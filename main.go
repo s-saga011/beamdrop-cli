@@ -61,7 +61,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.8.1"
+var Version = "v0.8.2"
 
 const (
 	chunkSize           = 16 * 1024
@@ -1401,7 +1401,14 @@ func runSend(args []string) {
 				if sampled < ccMinSample {
 					continue
 				}
-				loss := float64(lost) / float64(sampled)
+				chunkLoss := float64(lost) / float64(sampled)
+				// Judge loss at the PACKET level, not the chunk level. One
+				// lost UDP packet kills the whole chunk, so at 48KB (~41
+				// packets) a mere 2% radio packet loss reads as >50% chunk
+				// loss — which used to trip the hard-cut every tick and
+				// death-spiral the rate to the floor (observed on Pixel).
+				pktPerChunk := math.Max(1, float64(sendChunkSize+20)/1200)
+				loss := 1 - math.Pow(1-chunkLoss, 1/pktPerChunk)
 				before := cc.getRate()
 				switch {
 				case loss < 0.01:
@@ -1458,8 +1465,8 @@ func runSend(args []string) {
 				}
 				ccLastLossPct.Store(int64(loss * 1000))
 				if after := cc.getRate(); after != before && ccDebug {
-					fmt.Fprintf(os.Stderr, "[cc] loss %.1f%% (%d/%d) drain %.1f rate %.1f → %.1f MB/s\n",
-						loss*100, lost, sampled, drain/1048576, before/1048576, after/1048576)
+					fmt.Fprintf(os.Stderr, "[cc] pkt-loss %.2f%% (chunk %.1f%%, %d/%d) drain %.1f rate %.1f → %.1f MB/s\n",
+						loss*100, chunkLoss*100, lost, sampled, drain/1048576, before/1048576, after/1048576)
 				}
 			}
 		}()
