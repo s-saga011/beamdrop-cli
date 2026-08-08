@@ -61,7 +61,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.7.0"
+var Version = "v0.7.1"
 
 const (
 	chunkSize           = 16 * 1024
@@ -1281,6 +1281,8 @@ func runSend(args []string) {
 	// <1% loss → rate ×1.1; >5% → ×0.8, with the non-congestive-loss guard:
 	// 3 straight cuts that don't improve loss mean the loss is ambient
 	// (radio / random), so hold instead of death-spiraling to the floor.
+	ccDebug := os.Getenv("BEAMDROP_DEBUG") == "1"
+	var ccLastLossPct atomic.Int64 // last measured loss ×10 (‰/10), for the progress line
 	if cc.enabled {
 		go func() {
 			ticker := time.NewTicker(ccTickInterval)
@@ -1326,8 +1328,10 @@ func runSend(args []string) {
 						}
 						if target < before {
 							cc.setRate(target)
-							fmt.Fprintf(os.Stderr, "[cc] receiver quiet (no bitmap %.1fs, drain %.1f) rate %.1f → %.1f MB/s\n",
-								float64(stallTicks)*ccTickInterval.Seconds(), drain/1048576, before/1048576, cc.getRate()/1048576)
+							if ccDebug {
+								fmt.Fprintf(os.Stderr, "[cc] receiver quiet (no bitmap %.1fs, drain %.1f) rate %.1f → %.1f MB/s\n",
+									float64(stallTicks)*ccTickInterval.Seconds(), drain/1048576, before/1048576, cc.getRate()/1048576)
+							}
 						}
 					}
 					continue
@@ -1396,7 +1400,8 @@ func runSend(args []string) {
 						cc.setRate(limit)
 					}
 				}
-				if after := cc.getRate(); after != before {
+				ccLastLossPct.Store(int64(loss * 1000))
+				if after := cc.getRate(); after != before && ccDebug {
 					fmt.Fprintf(os.Stderr, "[cc] loss %.1f%% (%d/%d) drain %.1f rate %.1f → %.1f MB/s\n",
 						loss*100, lost, sampled, drain/1048576, before/1048576, after/1048576)
 				}
@@ -1476,10 +1481,21 @@ func runSend(args []string) {
 			}
 			rate := float64(pushed-lastP) / dt / 1024 / 1024
 			extra := ""
-			if pushed > totalBytes {
-				extra = fmt.Sprintf("  pushed %s", formatBytes(pushed))
+			if cc.enabled {
+				// Only show the pacing rate while it is actually the
+				// constraint — past ~64MB/s it has grown out of the way and
+				// the number would just race upward meaninglessly.
+				if r := cc.getRate(); r < 64*1048576 {
+					extra += fmt.Sprintf("  cc %.1f", r/1048576)
+				}
+				if lp := ccLastLossPct.Load(); lp >= 10 { // ≥1.0%
+					extra += fmt.Sprintf(" loss %.1f%%", float64(lp)/10)
+				}
 			}
-			fmt.Printf("\r  %s %5.1f%%  %s/%s  %.1f MB/s%s   ",
+			if pushed > totalBytes {
+				extra += fmt.Sprintf("  pushed %s", formatBytes(pushed))
+			}
+			fmt.Printf("\r  %s %5.1f%%  %s/%s  %.1f MB/s%s\x1b[K",
 				progressBar(pct, 30), pct, formatBytes(ackedBytes), formatBytes(totalBytes), rate, extra)
 		}
 		return nil
