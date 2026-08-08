@@ -61,7 +61,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.7.1"
+var Version = "v0.7.2"
 
 const (
 	chunkSize           = 16 * 1024
@@ -1324,7 +1324,9 @@ func runSend(args []string) {
 						before := cc.getRate()
 						target := before * 0.5
 						if drain > 0 {
-							target = math.Max(drain*0.6, ccMinRate)
+							// Just under capacity is enough to shrink the
+							// backlog; ×0.6 dug a needless trough.
+							target = math.Max(drain*0.85, ccMinRate)
 						}
 						if target < before {
 							cc.setRate(target)
@@ -1360,7 +1362,15 @@ func runSend(args []string) {
 					if slowStart {
 						cc.setRate(before * ccSlowStartGrowth)
 					} else {
-						cc.setRate(before * 1.1)
+						// Explore above the receiver's observed absorption,
+						// but not past ×1.35 of it — unbounded growth is what
+						// caused the 5→24MB/s sawtooth on CPU-bound
+						// receivers (climb, backlog, quiet-freeze, deep cut).
+						next := before * 1.1
+						if drain > 0 && next > drain*1.35 {
+							next = math.Max(before, drain*1.35)
+						}
+						cc.setRate(next)
 					}
 					decreaseStreak = 0
 				case loss > 0.5:
