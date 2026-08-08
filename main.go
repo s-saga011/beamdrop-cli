@@ -61,7 +61,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.8.0"
+var Version = "v0.8.1"
 
 const (
 	chunkSize           = 16 * 1024
@@ -1817,7 +1817,7 @@ func runSend(args []string) {
 			if stagnant >= stagnantPassThreshold {
 				ab, _ := json.Marshal(map[string]any{"type": "abort", "reason": "no receiver progress for too many retransmit passes"})
 				_ = controlDC.SendText(string(ab))
-				die(fmt.Errorf("retransmit stagnated: receiver bitmap unchanged for %d passes (still %d/%d chunks)", stagnant, curReceivedBits, expectedChunks))
+				die(fmt.Errorf("retransmit stagnated: receiver stopped acknowledging (%d/%d chunks). The receiver may have run out of disk space or crashed — check its terminal/screen", curReceivedBits, expectedChunks))
 			}
 		} else {
 			stagnant = 0
@@ -2028,6 +2028,14 @@ func runRecv(args []string) {
 		}
 		offset := int64(seq) * metaChunkSize
 		if _, err := outFile.WriteAt(pt, offset); err != nil {
+			// A write failure (disk full, permissions, I/O error) must be
+			// LOUD: swallowing it leaves the bitmap bit unset, the sender
+			// retransmits the chunk forever, and the transfer "stalls at
+			// 100%" with no error anywhere. Observed with a 10.8GB file.
+			select {
+			case transferDone <- fmt.Errorf("write failed at %s (disk full?): %w", formatBytes(offset), err):
+			default:
+			}
 			return false
 		}
 		setBit(recvBitmap, int(seq))
@@ -2216,6 +2224,17 @@ func runRecv(args []string) {
 			}
 			metaFileHash = m.PrefixHash
 			_ = metaFileHash // silence unused (we stash prefix hash separately below)
+
+			// Fail in one second, not after ten gigabytes: check free space
+			// up front (the mid-transfer write-error path still covers races).
+			if free := diskFree("."); free >= 0 && m.Size > 0 && free < m.Size+64*1024*1024 {
+				select {
+				case transferDone <- fmt.Errorf("not enough disk space: need %s, only %s free",
+					formatBytes(m.Size), formatBytes(free)):
+				default:
+				}
+				return // deferred stMu.Unlock runs
+			}
 
 			alreadyHave, resumeBm := scanResume(m.PrefixHash)
 			partPath := metaName + ".part"
