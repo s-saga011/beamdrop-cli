@@ -1020,6 +1020,9 @@ func runSend(args []string) {
 		}
 	})
 
+	// receiverGone: the receiver left mid-transfer. A new one restarts us via
+	// handoff; until then there is nobody to send to.
+	var receiverGone atomic.Bool
 	sendOffers := func(peerID string) {
 		remotePeerID.Store(peerID)
 		for i, pc := range pcs {
@@ -1108,6 +1111,7 @@ func runSend(args []string) {
 				// the transfer for it; if nobody comes, the stall watchdog
 				// (or the 10-minute connect timeout) ends the wait.
 				if !transferComplete.Load() {
+					receiverGone.Store(true)
 					fmt.Fprintf(os.Stderr, "\nReceiver left - waiting for it (or a new receiver) to join...\n")
 				}
 			case "error":
@@ -1838,6 +1842,7 @@ func runSend(args []string) {
 	prevAttempted := 0
 	curInterval := retransmitInterval
 	curBatchLimit := retransmitBatchLimit
+	var goneSince time.Time
 	for pass < maxRetransmitPasses && !transferComplete.Load() {
 		select {
 		case err := <-wsErr:
@@ -1851,6 +1856,19 @@ func runSend(args []string) {
 		}
 		if transferComplete.Load() {
 			break
+		}
+		if receiverGone.Load() {
+			// Retransmitting into a room with no receiver only burns the
+			// stagnation budget (~1 min) and then dies — too short for
+			// someone who is installing the CLI to take over. Idle here
+			// instead; a new receiver re-executes us before this returns.
+			if goneSince.IsZero() {
+				goneSince = time.Now()
+			}
+			if time.Since(goneSince) > stallHardTimeout {
+				die(fmt.Errorf("the receiver left and no receiver joined within %s", stallHardTimeout))
+			}
+			continue
 		}
 		recvBitmapMu.Lock()
 		bm := recvBitmap
