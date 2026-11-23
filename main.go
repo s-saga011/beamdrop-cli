@@ -1029,6 +1029,7 @@ func runSend(args []string) {
 			DurationMs    int64          `json:"durationMs"`
 			I             int            `json:"i"`
 			N             int            `json:"n"`
+			Later         int            `json:"later"`
 			Reason        string         `json:"reason"`
 		}
 		if err := json.Unmarshal(msg.Data, &m); err != nil {
@@ -1037,7 +1038,7 @@ func runSend(args []string) {
 		switch m.Type {
 		case "wt-ready", "wt-fail":
 			select {
-			case wtReplyCh <- wtReply{ok: m.Type == "wt-ready", idx: m.I, conns: m.N, reason: m.Reason}:
+			case wtReplyCh <- wtReply{ok: m.Type == "wt-ready", idx: m.I, conns: m.N, later: m.Later == 1, reason: m.Reason}:
 			default:
 			}
 		case "resume":
@@ -1306,10 +1307,31 @@ func runSend(args []string) {
 	// when it advertised caps.wt and the route is local; if it cannot
 	// connect within a few seconds we carry on exactly as before.
 	// BEAMDROP_WT=0 disables it, =1 offers it regardless of the route.
+	// If the receiver's browser is still asking its user for local network
+	// access (Chrome, private IPv4 address), we start on the data channels
+	// and move over when the "wt-ready" finally arrives (wtLate).
 	var wt *wtSender
+	var wtSrv *wtServer
+	var wtLate atomic.Pointer[wtSender]
 	if wtEnv := os.Getenv("BEAMDROP_WT"); !fl.relay && len(relDCs) > 0 && wtEnv != "0" && peerWantsWT.Load() &&
 		(wtEnv == "1" || routeIsLocal(pcs)) {
-		wt = negotiateWT(pcs, controlDC, wtReplyCh, transferComplete.Load)
+		wt, wtSrv = negotiateWT(pcs, controlDC, wtReplyCh, transferComplete.Load)
+	}
+	if wtSrv != nil {
+		defer wtSrv.close()
+	}
+	if wt == nil && wtSrv != nil {
+		go func() {
+			for r := range wtReplyCh {
+				if !r.ok {
+					continue
+				}
+				if s := wtSrv.sender(r); s != nil {
+					wtLate.Store(s)
+				}
+				return
+			}
+		}()
 	}
 
 	// ===== Phase E: bandwidth probe (datagram path only) =====
@@ -1323,7 +1345,6 @@ func runSend(args []string) {
 	// BEAMDROP_RELIABLE=1 / =0 forces it either way.
 	useReliable := false
 	if wt != nil {
-		defer wt.srv.close()
 		// No congestion control, probe or extra connections: QUIC does its
 		// own. The reliable channels stand by in case the session dies.
 		dataDCs, bufLow = relDCs, relBufLow
@@ -1992,48 +2013,61 @@ func runSend(args []string) {
 		}()
 	}
 
-	if wt != nil {
+	if wtSrv != nil {
 		go func() { // an abort must unblock stream writes
 			<-abortSig
-			wt.srv.close()
+			wtSrv.close()
 		}()
-		err := wt.send(
-			func() (uint32, []byte, bool) { cd, ok := <-chunks; return cd.seq, cd.pt, ok },
-			func(seq uint32, pt []byte) []byte { return encryptChunk(aead, pt, seq, 0) },
-			func(n int) { bytesPushed.Add(int64(n)); reportProgress() },
-			transferComplete.Load)
-		if err != nil && !transferComplete.Load() {
-			// The workers below take over on the reliable channels; whatever
-			// was in flight is re-sent by the retransmit phase.
-			fmt.Fprintf(os.Stderr, "\nWebTransport session lost - continuing over the data channels\n")
-			dbgf("[wt] %v\n", err)
-		}
 	}
-
-	var wg sync.WaitGroup
-	for i := 0; i < len(dataDCs); i++ {
-		wg.Add(1)
-		idx := i
-		go func() {
-			defer wg.Done()
-			dc := dataDCs[idx]
-			ch := bufLow[idx]
-			for cd := range chunks {
-				if transferComplete.Load() {
-					return
-				}
-				waitInflight(cd.seq)
-				cc.consume(len(cd.pt), abortSig) // Phase F pacing (no-op on relay)
-				if err := sendChunk(dc, ch, cd.seq, cd.pt); err != nil {
-					return
-				}
-				sentMu.Lock()
-				setBit(sentBitmap, int(cd.seq))
-				sentMu.Unlock()
+	for {
+		if wt != nil {
+			err := wt.send(
+				func() (uint32, []byte, bool) { cd, ok := <-chunks; return cd.seq, cd.pt, ok },
+				func(seq uint32, pt []byte) []byte { return encryptChunk(aead, pt, seq, 0) },
+				func(n int) { bytesPushed.Add(int64(n)); reportProgress() },
+				transferComplete.Load)
+			if err != nil && !transferComplete.Load() {
+				// The workers below take over on the data channels; whatever
+				// was in flight is re-sent by the retransmit phase.
+				fmt.Fprintf(os.Stderr, "\nWebTransport session lost - continuing over the data channels\n")
+				dbgf("[wt] %v\n", err)
 			}
-		}()
+		}
+
+		var wg sync.WaitGroup
+		for i := 0; i < len(dataDCs); i++ {
+			wg.Add(1)
+			idx := i
+			go func() {
+				defer wg.Done()
+				dc := dataDCs[idx]
+				ch := bufLow[idx]
+				for cd := range chunks {
+					if transferComplete.Load() {
+						return
+					}
+					waitInflight(cd.seq)
+					cc.consume(len(cd.pt), abortSig) // Phase F pacing (no-op on relay)
+					if err := sendChunk(dc, ch, cd.seq, cd.pt); err != nil {
+						return
+					}
+					sentMu.Lock()
+					setBit(sentBitmap, int(cd.seq))
+					sentMu.Unlock()
+					if wt == nil && wtLate.Load() != nil {
+						return // the WebTransport path came up: hand over
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		if late := wtLate.Load(); wt == nil && late != nil && !transferComplete.Load() {
+			wt = late
+			fmt.Fprintf(os.Stderr, "\nReceiver allowed local network access - switching to WebTransport\n")
+			continue
+		}
+		break
 	}
-	wg.Wait()
 
 	if v := producerErr.Load(); v != nil {
 		die(fmt.Errorf("read file: %w", v.(error)))

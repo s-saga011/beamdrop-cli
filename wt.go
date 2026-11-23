@@ -54,7 +54,7 @@ import (
 
 const (
 	wtStreams      = 4               // unidirectional streams, one worker each
-	wtMaxConns     = 3               // QUIC connections offered (BEAMDROP_WT_CONNS overrides, 1-8)
+	wtMaxConns     = 1               // QUIC connections offered (BEAMDROP_WT_CONNS overrides, 1-8); 2-6 measured no faster
 	wtReadyTimeout = 5 * time.Second // receiver must answer the offer within this
 	wtWriteBuf     = 256 * 1024      // per-stream write coalescing
 )
@@ -62,8 +62,9 @@ const (
 // wtReply is the receiver's answer to our offer (control DC).
 type wtReply struct {
 	ok     bool
-	idx    int // which offered URL it connected to
-	conns  int // sessions it opened to that URL (0 = an older page: one)
+	idx    int  // which offered URL it connected to
+	conns  int  // sessions it opened to that URL (0 = an older page: one)
+	later  bool // with !ok: it keeps trying (a permission prompt is open)
 	reason string
 }
 
@@ -293,18 +294,56 @@ type wtSender struct {
 	broken  atomic.Bool
 }
 
+// sender turns the receiver's "ready" into a wtSender with its streams open.
+// nil (reason in the debug log) means the sessions are not usable.
+func (srv *wtServer) sender(r wtReply) *wtSender {
+	s := &wtSender{srv: srv}
+	for c := 0; c < max(r.conns, 1) && c < srv.conns; c++ {
+		if sess := srv.session(r.idx, c); sess != nil {
+			s.sess = append(s.sess, sess)
+		}
+	}
+	if len(s.sess) == 0 {
+		dbgf("[wt] receiver reported ready but no session %d\n", r.idx)
+		return nil
+	}
+	// Same number of workers either way: with several connections, two
+	// streams on each.
+	per := wtStreams
+	if len(s.sess) > 1 {
+		per = 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	for _, sess := range s.sess {
+		for i := 0; i < per; i++ {
+			str, err := sess.OpenUniStreamSync(ctx)
+			if err != nil {
+				dbgf("[wt] open stream: %v\n", err)
+				return nil
+			}
+			s.streams = append(s.streams, str)
+		}
+	}
+	dbgf("[wt] %d connection(s), %d streams\n", len(s.sess), len(s.streams))
+	return s
+}
+
 // negotiateWT offers the WebTransport path to the receiver and waits for its
-// answer. nil means "carry on with the data channels" (reason in debug log).
-func negotiateWT(pcs []*webrtc.PeerConnection, controlDC *webrtc.DataChannel, replies <-chan wtReply, done func() bool) *wtSender {
+// answer. A nil sender means "carry on with the data channels" (reason in
+// the debug log). In that case a non-nil server is still listening: the
+// receiver is waiting on a browser permission prompt and may yet send
+// "wt-ready" (see wtServer.sender); the caller closes it.
+func negotiateWT(pcs []*webrtc.PeerConnection, controlDC *webrtc.DataChannel, replies <-chan wtReply, done func() bool) (*wtSender, *wtServer) {
 	srv, err := startWT(wtLocalAddrs(pcs))
 	if err != nil {
 		dbgf("[wt] not offered: %v\n", err)
-		return nil
+		return nil, nil
 	}
 	if err := controlDC.SendText(srv.offerJSON()); err != nil {
 		dbgf("[wt] offer not sent: %v\n", err)
 		srv.close()
-		return nil
+		return nil, nil
 	}
 	start := time.Now()
 	timeout := time.After(wtReadyTimeout)
@@ -314,51 +353,26 @@ func negotiateWT(pcs []*webrtc.PeerConnection, controlDC *webrtc.DataChannel, re
 		select {
 		case r := <-replies:
 			if !r.ok {
-				dbgf("[wt] receiver declined after %s (%s) - using data channels\n", time.Since(start).Round(time.Millisecond), r.reason)
-				srv.close()
-				return nil
-			}
-			s := &wtSender{srv: srv}
-			for c := 0; c < max(r.conns, 1) && c < srv.conns; c++ {
-				if sess := srv.session(r.idx, c); sess != nil {
-					s.sess = append(s.sess, sess)
+				dbgf("[wt] receiver declined after %s (%s, later=%v) - using data channels\n", time.Since(start).Round(time.Millisecond), r.reason, r.later)
+				if r.later {
+					return nil, srv
 				}
-			}
-			if len(s.sess) == 0 {
-				dbgf("[wt] receiver reported ready but no session %d - using data channels\n", r.idx)
 				srv.close()
-				return nil
+				return nil, nil
 			}
-			// Same number of workers either way: with several
-			// connections, two streams on each.
-			per := wtStreams
-			if len(s.sess) > 1 {
-				per = 2
+			if s := srv.sender(r); s != nil {
+				return s, srv
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			for _, sess := range s.sess {
-				for i := 0; i < per; i++ {
-					str, err := sess.OpenUniStreamSync(ctx)
-					if err != nil {
-						cancel()
-						dbgf("[wt] open stream: %v - using data channels\n", err)
-						srv.close()
-						return nil
-					}
-					s.streams = append(s.streams, str)
-				}
-			}
-			cancel()
-			dbgf("[wt] %d connection(s), %d streams\n", len(s.sess), len(s.streams))
-			return s
+			srv.close()
+			return nil, nil
 		case <-timeout:
 			dbgf("[wt] no answer in %s - using data channels\n", wtReadyTimeout)
 			srv.close()
-			return nil
+			return nil, nil
 		case <-tick.C:
 			if done() {
 				srv.close()
-				return nil
+				return nil, nil
 			}
 		}
 	}
