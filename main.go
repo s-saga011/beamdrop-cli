@@ -70,6 +70,7 @@ const (
 	bufferedHigh        = 4 * 1024 * 1024
 	bufferedLow         = 1 * 1024 * 1024
 	numPCs              = 4
+	extraReliablePCs    = 4 // added for browser receivers in reliable mode
 	seqHeaderBytes      = 4
 	ivLength            = 12
 	prefixHashSize      = 4096
@@ -839,6 +840,19 @@ func runSend(args []string) {
 		defer pc.Close()
 	}
 
+	// Extra connections, added once we know the receiver is a browser that
+	// wants reliable channels (see below). Indexed by pcIdx >= effectivePCs.
+	var extraMu sync.Mutex
+	extraPCs := map[int]*webrtc.PeerConnection{}
+	pcAt := func(idx int) *webrtc.PeerConnection {
+		if idx >= 0 && idx < effectivePCs {
+			return pcs[idx]
+		}
+		extraMu.Lock()
+		defer extraMu.Unlock()
+		return extraPCs[idx]
+	}
+
 	var remotePeerID atomic.Value
 	// offerBroadcast: takeover joined a room that already holds the receiver.
 	// The server never tells a joiner who else is there, so offers and ICE go
@@ -1140,7 +1154,7 @@ func runSend(args []string) {
 			if msg.PcIdx != nil {
 				idx = *msg.PcIdx
 			}
-			if idx < 0 || idx >= effectivePCs {
+			if pcAt(idx) == nil {
 				idx = 0
 			}
 			dbgf("[ws] recv type=%s peer=%s pcIdx=%d\n", msg.Type, msg.PeerID, idx)
@@ -1180,12 +1194,12 @@ func runSend(args []string) {
 				if prev, _ := remotePeerID.Load().(string); prev == "" && msg.From != "" {
 					remotePeerID.Store(msg.From) // broadcast offer: now we know the receiver
 				}
-				if msg.SDP != nil && pcs[idx] != nil {
-					_ = pcs[idx].SetRemoteDescription(*msg.SDP)
+				if msg.SDP != nil && pcAt(idx) != nil {
+					_ = pcAt(idx).SetRemoteDescription(*msg.SDP)
 				}
 			case "ice":
-				if msg.Candidate != nil && pcs[idx] != nil {
-					_ = pcs[idx].AddICECandidate(*msg.Candidate)
+				if msg.Candidate != nil && pcAt(idx) != nil {
+					_ = pcAt(idx).AddICECandidate(*msg.Candidate)
 				}
 			case "peer-left":
 				// Not fatal: the receiver may be switching to the CLI (or
@@ -1292,6 +1306,76 @@ func runSend(args []string) {
 	if useReliable {
 		dataDCs, bufLow = relDCs, relBufLow
 		fmt.Println("Mode: reliable channels (receiver asked for them, local route)")
+		// One reliable SCTP association is the bottleneck on a slightly
+		// lossy path: its own congestion control backs off on every lost
+		// packet. Measured to a Pixel over Wi-Fi: ~3 MB/s per connection, 4
+		// connections 12.0 MB/s, 8 connections 16.1 MB/s (1GB in 85s -> 64s).
+		// Only a receiver that asked for reliable channels gets here, i.e.
+		// a browser, and browsers accept any number of connections; the CLI
+		// receiver handles exactly numPCs, so it must never see these.
+		if os.Getenv("BEAMDROP_EXTRA_PCS") != "0" {
+			rid, _ := remotePeerID.Load().(string)
+			opened := make(chan struct{}, extraReliablePCs)
+			var xDCs []*webrtc.DataChannel
+			var xLow []chan struct{}
+			for k := 0; k < extraReliablePCs; k++ {
+				idx := effectivePCs + k
+				pc, err := pcAPI.NewPeerConnection(pcConfig)
+				if err != nil {
+					break
+				}
+				defer pc.Close()
+				extraMu.Lock()
+				extraPCs[idx] = pc
+				extraMu.Unlock()
+				pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+					if c == nil {
+						return
+					}
+					ci := c.ToJSON()
+					_ = ws.write(sigMsg{Type: "ice", To: rid, Candidate: &ci, PcIdx: ptr(idx)})
+				})
+				dc, err := pc.CreateDataChannel(fmt.Sprintf("rel-%d", idx), &webrtc.DataChannelInit{Ordered: ptr(true)})
+				if err != nil {
+					break
+				}
+				dc.SetBufferedAmountLowThreshold(bufferedLow)
+				low := make(chan struct{}, 1)
+				dc.OnBufferedAmountLow(func() {
+					select {
+					case low <- struct{}{}:
+					default:
+					}
+				})
+				dc.OnOpen(func() { opened <- struct{}{} })
+				offer, err := pc.CreateOffer(nil)
+				if err != nil || pc.SetLocalDescription(offer) != nil {
+					break
+				}
+				_ = ws.write(sigMsg{Type: "offer", To: rid, SDP: &offer, PcIdx: ptr(idx)})
+				xDCs = append(xDCs, dc)
+				xLow = append(xLow, low)
+			}
+			// All or nothing, and never wait long: 4 connections work fine.
+			got := 0
+			deadline := time.After(5 * time.Second)
+		waitExtra:
+			for got < len(xDCs) {
+				select {
+				case <-opened:
+					got++
+				case <-deadline:
+					break waitExtra
+				}
+			}
+			if got > 0 && got == len(xDCs) {
+				dataDCs = append(append([]*webrtc.DataChannel{}, dataDCs...), xDCs...)
+				bufLow = append(append([]chan struct{}{}, bufLow...), xLow...)
+				fmt.Printf("Using %d connections (browser receiver)\n", len(dataDCs))
+			} else {
+				dbgf("[pc] extra connections not ready (%d/%d) - staying with %d\n", got, len(xDCs), len(dataDCs))
+			}
+		}
 	}
 	cc := newCC(!fl.relay && !useReliable)
 	sendTimes := make([]int64, expectedChunks) // unix ms of last send per seq (atomic)
@@ -1669,6 +1753,11 @@ func runSend(args []string) {
 			if transferComplete.Load() {
 				return nil
 			}
+			// A channel that died for good never drains; don't wait on it
+			// forever (the chunk is picked up by the retransmit phase).
+			if st := dc.ReadyState(); st == webrtc.DataChannelStateClosing || st == webrtc.DataChannelStateClosed {
+				return io.ErrClosedPipe
+			}
 			select {
 			case <-ch:
 			case <-abortSig:
@@ -1867,7 +1956,7 @@ func runSend(args []string) {
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < effectivePCs; i++ {
+	for i := 0; i < len(dataDCs); i++ {
 		wg.Add(1)
 		idx := i
 		go func() {
