@@ -24,6 +24,18 @@ var asciiUI = func() bool {
 	return platformNeedsASCII()
 }()
 
+// outputIsTerminal is false when stdout is piped or redirected (only
+// determined on Windows, where it decides the wording below).
+var outputIsTerminal = true
+
+// qrOmittedNote explains why no QR code was printed in ASCII mode.
+func qrOmittedNote() string {
+	if !outputIsTerminal {
+		return "(QR code not shown: output is not a terminal.)"
+	}
+	return "(QR code not shown: this console cannot draw it.)"
+}
+
 // debugLog gates connection-level chatter (signaling messages, ICE
 // candidates and state changes): hundreds of lines per transfer that bury
 // the progress bar. BEAMDROP_DEBUG=1 brings them back.
@@ -74,7 +86,7 @@ func describeRoute(pcs []*webrtc.PeerConnection) string {
 		// are usually the same hosts over another address family.
 		s := fmt.Sprintf("%s x%d (%s -> %s", kind, count[kind], paths[kind][0].local, paths[kind][0].remote)
 		if extra := len(paths[kind]) - 1; extra > 0 {
-			s += fmt.Sprintf(", +%d other address pair(s)", extra)
+			s += fmt.Sprintf(", +%d more", extra)
 		}
 		parts = append(parts, s+")")
 	}

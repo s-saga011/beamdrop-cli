@@ -15,12 +15,27 @@ type handoff struct {
 	key   []byte
 	token string // our signaling peer token (keeps our peerId)
 	peer  string // the new receiver's peerId
+
+	// Sender takeover (beamdrop://HOST/s/... link, see sendlink.go): we are a
+	// NEW sender joining a room a web page was serving. No peer id is known
+	// up front; chunk and name keep the meta identical to the page's so a
+	// receiver that is mid-file resumes instead of starting over.
+	takeover bool
+	chunk    int64
+	name     string
 }
+
+// pendingTakeover is set by `beamdrop open` for a /s/ link, in-process.
+var pendingTakeover *handoff
 
 const handoffEnv = "BEAMDROP_HANDOFF"
 
 // takeHandoff reads and clears the handoff left by the previous incarnation.
 func takeHandoff() *handoff {
+	if h := pendingTakeover; h != nil {
+		pendingTakeover = nil
+		return h
+	}
 	v := os.Getenv(handoffEnv)
 	if v == "" {
 		return nil

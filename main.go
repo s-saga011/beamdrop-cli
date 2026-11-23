@@ -445,7 +445,9 @@ func (s *safeWS) reconnectWithBackoff(giveUp func() bool) bool {
 		}
 		s.conn = c
 		s.mu.Unlock()
-		fmt.Fprintf(os.Stderr, "[ws] reconnected (attempt %d)\n", attempt)
+		if !knockingOnFullRoom() {
+			fmt.Fprintf(os.Stderr, "[ws] reconnected (attempt %d)\n", attempt)
+		}
 		return true
 	}
 	return false
@@ -718,6 +720,18 @@ func runSend(args []string) {
 		}
 	}
 
+	// Receiver handoff: when a new receiver replaces the old one (the web
+	// page's "receive with the app" button, or simply a reloaded tab), the
+	// previous incarnation of this process re-executed us with the same
+	// room, key and signaling identity - see handoffToNewReceiver.
+	// Sender takeover (ho.takeover): we replace a web page that was sending
+	// this file - same room and key, but a new signaling identity.
+	ho := takeHandoff()
+	takeover := ho != nil && ho.takeover
+	if takeover && ho.chunk > 0 {
+		sendChunkSize = ho.chunk
+	}
+
 	stat, err := os.Stat(path)
 	if err != nil {
 		die(err)
@@ -735,11 +749,6 @@ func runSend(args []string) {
 		die(fmt.Errorf("prefix hash: %w", err))
 	}
 
-	// Receiver handoff: when a new receiver replaces the old one (the web
-	// page's "receive with the app" button, or simply a reloaded tab), the
-	// previous incarnation of this process re-executed us with the same
-	// room, key and signaling identity - see handoffToNewReceiver.
-	ho := takeHandoff()
 	keyBytes := make([]byte, 32)
 	if ho != nil {
 		keyBytes = ho.key
@@ -767,6 +776,9 @@ func runSend(args []string) {
 	}
 	if ho == nil {
 		printShareInstructions(room, shareURL)
+	} else if takeover {
+		// The share link already exists (the page made it) - no box, no QR.
+		fmt.Printf("Taking over the send from the browser (room %s, same share link).\n", room)
 	}
 
 	iceServers, err := fetchICE(server)
@@ -788,7 +800,7 @@ func runSend(args []string) {
 	}
 
 	peerToken := newPeerToken()
-	if ho != nil {
+	if ho != nil && !takeover {
 		peerToken = ho.token // same peerId server-side: the new receiver sees no churn
 	}
 	ws, err := dialSignaling(server, room, peerToken)
@@ -819,6 +831,10 @@ func runSend(args []string) {
 	}
 
 	var remotePeerID atomic.Value
+	// offerBroadcast: takeover joined a room that already holds the receiver.
+	// The server never tells a joiner who else is there, so offers and ICE go
+	// out without "to" (= to the other peer) until its answer names it.
+	var offerBroadcast atomic.Bool
 	var peerChunkHint atomic.Int64 // receiver's preferred chunk size (WS "hello")
 	everConnected := make([]atomic.Bool, effectivePCs)
 	iceRestartReq := make(chan int, effectivePCs*2)
@@ -833,7 +849,7 @@ func runSend(args []string) {
 			ci := c.ToJSON()
 			dbgf("[pc%d] local cand: %s\n", idx, ci.Candidate)
 			rid, _ := remotePeerID.Load().(string)
-			if rid == "" {
+			if rid == "" && !offerBroadcast.Load() {
 				return
 			}
 			_ = ws.write(sigMsg{Type: "ice", To: rid, Candidate: &ci, PcIdx: ptr(idx)})
@@ -1043,12 +1059,13 @@ func runSend(args []string) {
 			}()
 		}
 	}
-	if ho != nil {
+	if ho != nil && !takeover {
 		// The new receiver joined before this process existed, so no
 		// peer-joined will arrive for it - offer right away.
 		fmt.Printf("Receiver changed - restarting the transfer for the new receiver.\n")
 		sendOffers(ho.peer)
 	}
+	takeoverOffered := false
 
 	wsErr := make(chan error, 1)
 	go func() {
@@ -1061,7 +1078,9 @@ func runSend(args []string) {
 				if transferComplete.Load() || ws.closed.Load() {
 					return
 				}
-				fmt.Fprintf(os.Stderr, "[ws] signaling lost: %v - reconnecting\n", err)
+				if !knockingOnFullRoom() {
+					fmt.Fprintf(os.Stderr, "[ws] signaling lost: %v - reconnecting\n", err)
+				}
 				if ws.reconnectWithBackoff(func() bool { return transferComplete.Load() }) {
 					continue
 				}
@@ -1081,6 +1100,17 @@ func runSend(args []string) {
 			dbgf("[ws] recv type=%s peer=%s pcIdx=%d\n", msg.Type, msg.PeerID, idx)
 			switch msg.Type {
 			case "joined":
+				// Takeover: role "guest" means the receiver is already in
+				// the room (no peer-joined will come for it) - offer now.
+				// Role "host" = empty room: wait for peer-joined as usual.
+				if takeover && msg.Role == "guest" && !takeoverOffered {
+					takeoverOffered = true
+					if prev, _ := remotePeerID.Load().(string); prev == "" {
+						dbgf("[ws] takeover: receiver already in the room -> broadcasting offers\n")
+						offerBroadcast.Store(true)
+						sendOffers("")
+					}
+				}
 			case "hello":
 				// Receiver capability advertisement - arrives during ICE
 				// setup, well before we build the meta.
@@ -1098,6 +1128,9 @@ func runSend(args []string) {
 				dbgf("[ws] peer-joined -> creating offer for %d pc(s)\n", len(pcs))
 				sendOffers(msg.PeerID)
 			case "answer":
+				if prev, _ := remotePeerID.Load().(string); prev == "" && msg.From != "" {
+					remotePeerID.Store(msg.From) // broadcast offer: now we know the receiver
+				}
 				if msg.SDP != nil && pcs[idx] != nil {
 					_ = pcs[idx].SetRemoteDescription(*msg.SDP)
 				}
@@ -1156,9 +1189,13 @@ func runSend(args []string) {
 	}
 
 	mime := "application/octet-stream"
+	metaName := filepath.Base(path)
+	if takeover && ho.name != "" {
+		metaName = ho.name // what the page announced; the local copy may be renamed
+	}
 	metaJSON, _ := json.Marshal(map[string]any{
 		"type":            "meta",
-		"name":            filepath.Base(path),
+		"name":            metaName,
 		"size":            totalBytes,
 		"mime":            mime,
 		"chunkSize":       sendChunkSize,
@@ -2074,6 +2111,7 @@ func runRecv(args []string) {
 	pcs := make([]*webrtc.PeerConnection, numPCs)
 	var pcsMu sync.Mutex
 	var remotePeerID atomic.Value
+	var senderGen atomic.Int64 // bumped when a different sender takes over the room
 	defer func() {
 		pcsMu.Lock()
 		defer pcsMu.Unlock()
@@ -2215,6 +2253,10 @@ func runRecv(args []string) {
 		rate := float64(metaSize) / elapsed.Seconds() / 1024 / 1024
 		fmt.Printf("Done: %s in %s (%.1f MB/s, E2E decrypted)%s\n",
 			formatBytes(metaSize), elapsed.Round(time.Millisecond), rate, verifyMsg)
+		savedPath, _ := filepath.Abs(metaName)
+		if savedPath != "" {
+			fmt.Printf("Saved: %s\n", savedPath)
+		}
 		if dc, ok := controlDC.Load().(*webrtc.DataChannel); ok && dc != nil {
 			ack, _ := json.Marshal(map[string]any{"type": "complete", "fileIdx": currentFileIdx})
 			_ = dc.SendText(string(ack))
@@ -2223,6 +2265,11 @@ func runRecv(args []string) {
 			// More batch files coming - stay alive and wait for the next meta.
 			fmt.Printf("File %d/%d received, waiting for next...\n", currentFileIdx+1, fileCount)
 			return
+		}
+		// Launched from a link: the window was opened for us and the user
+		// never chose a folder - show them where the file went.
+		if holdWindow && savedPath != "" && os.Getenv("BEAMDROP_NO_REVEAL") != "1" {
+			revealFile(savedPath)
 		}
 		select {
 		case transferDone <- nil:
@@ -2297,9 +2344,29 @@ func runRecv(args []string) {
 			if mCount == 0 {
 				mCount = 1
 			}
-			if gotMeta && m.FileIdx == currentFileIdx {
-				// Duplicate meta (sender restarted after a reconnect): answer
-				// with our CURRENT bitmap so it skips chunks we already hold.
+			dupChunk := m.ChunkSize
+			if dupChunk == 0 {
+				dupChunk = chunkSize
+			}
+			dupName := m.Name
+			if m.Path != "" && filepath.IsLocal(filepath.FromSlash(m.Path)) {
+				dupName = filepath.FromSlash(m.Path)
+			}
+			if gotMeta && m.FileIdx == currentFileIdx && (dupName != metaName || m.Size != metaSize || dupChunk != metaChunkSize) {
+				// Same slot, different file (a replacement sender picked
+				// something else): what we hold is useless - start over.
+				fmt.Printf("\nSender now offers a different file - starting over.\n")
+				if outFile != nil {
+					_ = outFile.Close()
+					outFile = nil
+				}
+				if !finished {
+					_ = os.Remove(metaName + ".part")
+				}
+			} else if gotMeta && m.FileIdx == currentFileIdx {
+				// Duplicate meta (sender restarted after a reconnect, or a
+				// new sender took over the same file): answer with our
+				// CURRENT bitmap so it skips chunks we already hold.
 				if dc, ok := controlDC.Load().(*webrtc.DataChannel); ok && dc != nil && recvBitmap != nil {
 					resume, _ := json.Marshal(map[string]any{
 						"type":    "resume",
@@ -2614,7 +2681,9 @@ func runRecv(args []string) {
 				if done {
 					return
 				}
-				fmt.Fprintf(os.Stderr, "[ws] signaling lost: %v - reconnecting\n", err)
+				if !knockingOnFullRoom() {
+					fmt.Fprintf(os.Stderr, "[ws] signaling lost: %v - reconnecting\n", err)
+				}
 				if ws.reconnectWithBackoff(nil) {
 					continue
 				}
@@ -2629,7 +2698,30 @@ func runRecv(args []string) {
 			}
 			switch msg.Type {
 			case "joined":
+				roomFullTries = 0 // we are in; later reconnects are real news again
 			case "offer":
+				if prev, _ := remotePeerID.Load().(string); prev != "" && msg.From != "" && prev != msg.From {
+					// A different sender took over the room (web page ->
+					// CLI). Its offers are for brand-new connections: drop
+					// the old ones. The partial file and bitmap stay; the
+					// new sender's meta is answered with the bitmap.
+					fmt.Fprintf(os.Stderr, "\nSender changed - continuing with the new sender.\n")
+					senderGen.Add(1)
+					pcsMu.Lock()
+					old := append([]*webrtc.PeerConnection(nil), pcs...)
+					for i := range pcs {
+						pcs[i] = nil
+					}
+					pcsMu.Unlock()
+					controlDC.Store((*webrtc.DataChannel)(nil))
+					go func() {
+						for _, pc := range old {
+							if pc != nil {
+								_ = pc.Close()
+							}
+						}
+					}()
+				}
 				remotePeerID.Store(msg.From)
 				pc, err := getOrCreatePc(idx)
 				if err != nil {
@@ -2680,15 +2772,22 @@ func runRecv(args []string) {
 				if done {
 					return
 				}
+				// The sender may be switching to the CLI (or coming back):
+				// keep the partial file and wait as long as a stall may last.
+				fmt.Fprintf(os.Stderr, "\nSender left - waiting up to %s for it (or a replacement sender)...\n", stallHardTimeout)
+				gen := senderGen.Load()
+				stMu.Lock()
+				bytesAtLeave := receivedBytes
+				stMu.Unlock()
 				go func() {
-					deadline := time.Now().Add(30 * time.Second)
+					deadline := time.Now().Add(stallHardTimeout)
 					for time.Now().Before(deadline) {
 						time.Sleep(500 * time.Millisecond)
 						stMu.Lock()
-						isDone := finished
+						isDone := finished || receivedBytes != bytesAtLeave
 						stMu.Unlock()
-						if isDone {
-							return
+						if isDone || senderGen.Load() != gen {
+							return // finished, or a sender is feeding us again
 						}
 					}
 					stMu.Lock()
@@ -2962,7 +3061,7 @@ func printShareInstructions(room, shareURL string) {
 	fmt.Println()
 	if asciiUI {
 		// A QR code needs block characters; in ASCII it would not scan.
-		fmt.Println("(QR code not shown: this console cannot draw it. Windows Terminal can.)")
+		fmt.Println(qrOmittedNote())
 	} else {
 		qrterminal.GenerateHalfBlock(shareURL, qrterminal.L, os.Stdout)
 	}

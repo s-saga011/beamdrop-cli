@@ -50,7 +50,20 @@ func linkToShareURL(link string) (string, error) {
 	if !linkAllowedHosts()[m[1]] {
 		return "", fmt.Errorf("link points at %q, which is not a trusted beamdrop server (set BEAMDROP_LINK_HOSTS to allow it)", m[1])
 	}
-	return "https://" + m[1] + "/r/" + m[2] + "#k=" + m[3] + m[4], nil
+	return linkServerURL(m[1]) + "/r/" + m[2] + "#k=" + m[3] + m[4], nil
+}
+
+// linkServerURL: links carry no scheme. Everything is https except a local
+// dev server (which still has to be listed in BEAMDROP_LINK_HOSTS).
+func linkServerURL(host string) string {
+	h := host
+	if i := strings.LastIndex(h, ":"); i >= 0 {
+		h = h[:i]
+	}
+	if h == "localhost" || h == "127.0.0.1" {
+		return "http://" + host
+	}
+	return "https://" + host
 }
 
 // waitForRoom makes recv retry a full room instead of failing: a link launch
@@ -59,6 +72,10 @@ var (
 	waitForRoom   bool
 	roomFullTries int
 )
+
+// knockingOnFullRoom: each retry of a full room is a close + re-dial; that
+// is the expected rhythm of waiting, not a signaling problem worth a line.
+func knockingOnFullRoom() bool { return waitForRoom && roomFullTries > 0 }
 
 // holdWindow is set when we were launched from a link: the terminal window
 // was opened just for us and (except on macOS, where Terminal keeps finished
@@ -75,10 +92,14 @@ func holdWindowIfNeeded() {
 
 func runOpen(args []string) {
 	holdWindow = true
-	waitForRoom = true
 	if len(args) != 1 {
 		die(fmt.Errorf("usage: beamdrop open beamdrop://HOST/r/ROOM#k=KEY"))
 	}
+	if strings.Contains(args[0], "/s/") {
+		runOpenSend(args[0])
+		return
+	}
+	waitForRoom = true
 	share, err := linkToShareURL(args[0])
 	if err != nil {
 		die(err)
