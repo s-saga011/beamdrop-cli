@@ -66,15 +66,15 @@ import (
 var Version = "v0.9.0"
 
 const (
-	chunkSize           = 16 * 1024
-	bufferedHigh        = 4 * 1024 * 1024
-	bufferedLow         = 1 * 1024 * 1024
-	numPCs              = 4
-	extraReliablePCs    = 4 // added for browser receivers in reliable mode
-	seqHeaderBytes      = 4
-	ivLength            = 12
-	prefixHashSize      = 4096
-	probeSeqBase        = 0xFFF00000 // data frames with seq >= this are bandwidth-probe dummies
+	chunkSize             = 16 * 1024
+	bufferedHigh          = 4 * 1024 * 1024
+	bufferedLow           = 1 * 1024 * 1024
+	numPCs                = 4
+	extraReliablePCs      = 4 // added for browser receivers in reliable mode
+	seqHeaderBytes        = 4
+	ivLength              = 12
+	prefixHashSize        = 4096
+	probeSeqBase          = 0xFFF00000 // data frames with seq >= this are bandwidth-probe dummies
 	bitmapInterval        = 200 * time.Millisecond
 	retransmitInterval    = 250 * time.Millisecond
 	maxRetransmitInterval = 8 * time.Second // back off up to this when receiver isn't keeping up
@@ -82,7 +82,7 @@ const (
 	retransmitBatchLimit  = 2000 // chunks per pass — keep small so receiver can drain between passes
 	retransmitBatchMin    = 200  // floor when we shrink the batch under loss
 	stagnantPassThreshold = 12   // ~3s of "no progress" passes before bailing
-	relayInflightWindow = 1000 // chunks (16MB) — relay-only cap, since pion bufferedAmount under-reports on TCP/TLS
+	relayInflightWindow   = 1000 // chunks (16MB) — relay-only cap, since pion bufferedAmount under-reports on TCP/TLS
 
 	// Phase E/F: sender-side bandwidth probe + congestion control (datagram
 	// path only — reliable/relay DCs already have SCTP's own CC).
@@ -103,12 +103,12 @@ const (
 	ccInitialCap      = 8 * 1024 * 1024.0
 	ccSlowStartGrowth = 1.6
 
-	resumeWaitTimeout   = 1500 * time.Millisecond
-	protocolVersion     = 3
-	defaultServer       = "https://p2p.draft-publish.com"
-	stallTimeout        = 30 * time.Second // stalled this long → try ICE restart (VPN/network change)
-	stallHardTimeout    = 3 * time.Minute  // stalled this long → give up for real
-	statsInterval       = 2 * time.Second  // sender->server stats cadence
+	resumeWaitTimeout = 1500 * time.Millisecond
+	protocolVersion   = 3
+	defaultServer     = "https://p2p.draft-publish.com"
+	stallTimeout      = 30 * time.Second // stalled this long → try ICE restart (VPN/network change)
+	stallHardTimeout  = 3 * time.Minute  // stalled this long → give up for real
+	statsInterval     = 2 * time.Second  // sender->server stats cadence
 )
 
 // ============================================================================
@@ -116,7 +116,8 @@ const (
 // ============================================================================
 
 // Bitmap layout matches the browser: one bit per seq, LSB-first within byte:
-//   bm[idx>>3] |= 1 << (idx & 7)
+//
+//	bm[idx>>3] |= 1 << (idx & 7)
 func newBitmap(numBits int) []byte {
 	if numBits <= 0 {
 		return nil
@@ -273,7 +274,7 @@ func hashFileFull(path string) (string, error) {
 // ============================================================================
 
 type sigMsg struct {
-	Caps map[string]int64 `json:"caps,omitempty"`
+	Caps      map[string]int64           `json:"caps,omitempty"`
 	Type      string                     `json:"type"`
 	From      string                     `json:"from,omitempty"`
 	To        string                     `json:"to,omitempty"`
@@ -1027,6 +1028,7 @@ func runSend(args []string) {
 			BytesReceived int64          `json:"bytesReceived"`
 			DurationMs    int64          `json:"durationMs"`
 			I             int            `json:"i"`
+			N             int            `json:"n"`
 			Reason        string         `json:"reason"`
 		}
 		if err := json.Unmarshal(msg.Data, &m); err != nil {
@@ -1035,7 +1037,7 @@ func runSend(args []string) {
 		switch m.Type {
 		case "wt-ready", "wt-fail":
 			select {
-			case wtReplyCh <- wtReply{ok: m.Type == "wt-ready", idx: m.I, reason: m.Reason}:
+			case wtReplyCh <- wtReply{ok: m.Type == "wt-ready", idx: m.I, conns: m.N, reason: m.Reason}:
 			default:
 			}
 		case "resume":

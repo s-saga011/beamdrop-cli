@@ -54,6 +54,7 @@ import (
 
 const (
 	wtStreams      = 4               // unidirectional streams, one worker each
+	wtMaxConns     = 3               // QUIC connections offered (BEAMDROP_WT_CONNS overrides, 1-8)
 	wtReadyTimeout = 5 * time.Second // receiver must answer the offer within this
 	wtWriteBuf     = 256 * 1024      // per-stream write coalescing
 )
@@ -62,6 +63,7 @@ const (
 type wtReply struct {
 	ok     bool
 	idx    int // which offered URL it connected to
+	conns  int // sessions it opened to that URL (0 = an older page: one)
 	reason string
 }
 
@@ -71,6 +73,7 @@ type wtServer struct {
 	token    string
 	urls     []string
 	certHash string
+	conns    int
 
 	mu       sync.Mutex
 	sessions map[int]*webtransport.Session
@@ -156,6 +159,13 @@ func startWT(addrs []netip.Addr) (*wtServer, error) {
 		certHash: base64.StdEncoding.EncodeToString(sum[:]),
 		sessions: map[int]*webtransport.Session{},
 		arrived:  make(chan struct{}, 8),
+		conns:    wtMaxConns,
+	}
+	if n, err := strconv.Atoi(os.Getenv("BEAMDROP_WT_CONNS")); err == nil && n >= 1 && n <= 8 {
+		w.conns = n
+	}
+	if t, err := netip.ParseAddr(os.Getenv("BEAMDROP_WT_TEST_ADDR")); err == nil {
+		addrs = []netip.Addr{t} // test hook: offer exactly this address (e.g. IPv4 only)
 	}
 	if os.Getenv("BEAMDROP_WT_TEST_BADPORT") == "2" {
 		addrs = []netip.Addr{netip.MustParseAddr("192.0.2.1")} // test hook: packets vanish (TEST-NET-1)
@@ -193,6 +203,9 @@ func startWT(addrs []netip.Addr) (*wtServer, error) {
 			return
 		}
 		idx, _ := strconv.Atoi(q.Get("i"))
+		if c, _ := strconv.Atoi(q.Get("c")); c > 0 && c < 16 {
+			idx += c << 8 // extra connection c to URL i (see wtServer.session)
+		}
 		sess, err := w.srv.Upgrade(rw, r)
 		if err != nil {
 			dbgf("[wt] upgrade failed: %v\n", err)
@@ -227,13 +240,18 @@ func (w *wtServer) offerJSON() string {
 		"urls":     w.urls,
 		"certHash": w.certHash,
 		"token":    w.token,
+		// One QUIC connection sends from one goroutine, a packet per
+		// syscall: the sender was the limit at ~45-55 MB/s. The page may
+		// open this many sessions (each its own connection) to one URL.
+		"conns": w.conns,
 	})
 	return string(b)
 }
 
 // session returns the session the receiver said it connected with. The
 // receiver's "ready" can overtake our own Upgrade bookkeeping by a moment.
-func (w *wtServer) session(idx int) *webtransport.Session {
+func (w *wtServer) session(idx, conn int) *webtransport.Session {
+	idx += conn << 8
 	deadline := time.After(time.Second)
 	for {
 		w.mu.Lock()
@@ -270,7 +288,7 @@ func (w *wtServer) close() {
 // wtSender is an established session with its streams open.
 type wtSender struct {
 	srv     *wtServer
-	sess    *webtransport.Session
+	sess    []*webtransport.Session
 	streams []*webtransport.SendStream
 	broken  atomic.Bool
 }
@@ -300,25 +318,38 @@ func negotiateWT(pcs []*webrtc.PeerConnection, controlDC *webrtc.DataChannel, re
 				srv.close()
 				return nil
 			}
-			sess := srv.session(r.idx)
-			if sess == nil {
+			s := &wtSender{srv: srv}
+			for c := 0; c < max(r.conns, 1) && c < srv.conns; c++ {
+				if sess := srv.session(r.idx, c); sess != nil {
+					s.sess = append(s.sess, sess)
+				}
+			}
+			if len(s.sess) == 0 {
 				dbgf("[wt] receiver reported ready but no session %d - using data channels\n", r.idx)
 				srv.close()
 				return nil
 			}
-			s := &wtSender{srv: srv, sess: sess}
+			// Same number of workers either way: with several
+			// connections, two streams on each.
+			per := wtStreams
+			if len(s.sess) > 1 {
+				per = 2
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			for i := 0; i < wtStreams; i++ {
-				str, err := sess.OpenUniStreamSync(ctx)
-				if err != nil {
-					cancel()
-					dbgf("[wt] open stream: %v - using data channels\n", err)
-					srv.close()
-					return nil
+			for _, sess := range s.sess {
+				for i := 0; i < per; i++ {
+					str, err := sess.OpenUniStreamSync(ctx)
+					if err != nil {
+						cancel()
+						dbgf("[wt] open stream: %v - using data channels\n", err)
+						srv.close()
+						return nil
+					}
+					s.streams = append(s.streams, str)
 				}
-				s.streams = append(s.streams, str)
 			}
 			cancel()
+			dbgf("[wt] %d connection(s), %d streams\n", len(s.sess), len(s.streams))
 			return s
 		case <-timeout:
 			dbgf("[wt] no answer in %s - using data channels\n", wtReadyTimeout)
@@ -384,7 +415,9 @@ func (s *wtSender) send(next func() (uint32, []byte, bool), encrypt func(uint32,
 				if killAfter > 0 && total.Add(int64(len(pt))) >= killAfter && !s.broken.Swap(true) {
 					fmt.Fprintf(os.Stderr, "\n[test] closing the WebTransport session after %d MB\n", killAfter>>20)
 					fail(errors.New("test kill"))
-					go s.sess.CloseWithError(0, "test")
+					for _, sess := range s.sess {
+						go sess.CloseWithError(0, "test")
+					}
 					return
 				}
 			}
@@ -400,5 +433,13 @@ func (s *wtSender) send(next func() (uint32, []byte, bool), encrypt func(uint32,
 
 // alive reports whether the session is still usable.
 func (s *wtSender) alive() bool {
-	return s != nil && !s.broken.Load() && s.sess.Context().Err() == nil
+	if s == nil || s.broken.Load() {
+		return false
+	}
+	for _, sess := range s.sess {
+		if sess.Context().Err() != nil {
+			return false
+		}
+	}
+	return true
 }
