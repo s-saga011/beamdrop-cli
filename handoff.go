@@ -43,7 +43,7 @@ func takeHandoff() *handoff {
 // rather than untangle it we re-execute ourselves: same argv, same room, key
 // and signaling identity, and a clean slate for everything else.
 func handoffToNewReceiver(h handoff, ws *safeWS, pcs []*webrtc.PeerConnection) {
-	fmt.Fprintf(os.Stderr, "\n[handoff] a new receiver joined — restarting the transfer for it\n")
+	fmt.Fprintf(os.Stderr, "\n[handoff] a new receiver joined - restarting the transfer for it\n")
 	env := append(os.Environ(), handoffEnv+"="+strings.Join(
 		[]string{h.room, b64URL.EncodeToString(h.key), h.token, h.peer}, "\n"))
 	ws.close()

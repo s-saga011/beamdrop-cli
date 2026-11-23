@@ -483,7 +483,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `beamdrop CLI — high-speed P2P file transfer
+	fmt.Fprint(os.Stderr, `beamdrop CLI - high-speed P2P file transfer
 
 Usage:
   beamdrop send <file> [--server URL] [--relay]
@@ -550,7 +550,7 @@ var tailscaleULA = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
 // newDirectAPI returns a UDP-only *webrtc.API that does not gather ICE
 // candidates on Tailscale interfaces. pion gives every host candidate the
 // same priority, so with both peers on one tailnet ICE happily nominates the
-// tunnel pair even on a shared LAN — measured CLI→CLI 12MB/s (1GB, bursts of
+// tunnel pair even on a shared LAN - measured CLI->CLI 12MB/s (1GB, bursts of
 // 8% loss) through the tunnel vs. 43-80MB/s on the same 2.5GbE LAN direct.
 // Set BEAMDROP_ALLOW_TAILSCALE=1 to keep the old behaviour.
 func newDirectAPI() *webrtc.API {
@@ -598,7 +598,7 @@ func newRelayAPI() *webrtc.API {
 
 // filterRelayTLS narrows iceServers to only the TLS:443 turns: URL,
 // dropping STUN and other TURN candidates. Used together with
-// ICETransportPolicyRelay to force every ICE pair through TLS/443/TCP —
+// ICETransportPolicyRelay to force every ICE pair through TLS/443/TCP -
 // the path that survives mobile-carrier UDP/P2P shaping (mimics HTTPS).
 func filterRelayTLS(iceServers []webrtc.ICEServer) []webrtc.ICEServer {
 	out := make([]webrtc.ICEServer, 0, len(iceServers))
@@ -632,7 +632,7 @@ func ptr[T any](v T) *T { return &v }
 // ccState is the shared token bucket the Phase-1 workers drain. Without it
 // the sender pushes at local-SCTP speed into a datagram channel, which on a
 // receiver slower than the path (phones) loses most of Phase 1 outright and
-// then crawls through a huge reliable-DC retransmit tail — the observed
+// then crawls through a huge reliable-DC retransmit tail - the observed
 // "starts at 26MB/s, finishes at 4MB/s" pattern. The probe seeds the rate;
 // the AIMD loop tracks the receiver's bitmap from there.
 type ccState struct {
@@ -738,7 +738,7 @@ func runSend(args []string) {
 	// Receiver handoff: when a new receiver replaces the old one (the web
 	// page's "receive with the app" button, or simply a reloaded tab), the
 	// previous incarnation of this process re-executed us with the same
-	// room, key and signaling identity — see handoffToNewReceiver.
+	// room, key and signaling identity - see handoffToNewReceiver.
 	ho := takeHandoff()
 	keyBytes := make([]byte, 32)
 	if ho != nil {
@@ -775,7 +775,7 @@ func runSend(args []string) {
 		iceServers = []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}
 	}
 	pcConfig := webrtc.Configuration{ICEServers: iceServers}
-	pcAPI := newDirectAPI() // UDP-only, skips Tailscale — fine for direct/UDP-TURN paths
+	pcAPI := newDirectAPI() // UDP-only, skips Tailscale - fine for direct/UDP-TURN paths
 	if fl.relay {
 		filtered := filterRelayTLS(iceServers)
 		if len(filtered) == 0 {
@@ -800,7 +800,7 @@ func runSend(args []string) {
 	// In --relay mode use a single PC. Allocating four parallel TURN
 	// allocations over TLS:443 from the same mobile IP appears to hit
 	// per-IP simultaneous-allocation limits at Cloudflare or in Chrome
-	// itself, with most allocations silently failing — so the DCs never
+	// itself, with most allocations silently failing - so the DCs never
 	// open and the receiver tab sits at 'シグナリングサーバーに接続中'.
 	// Reliability path doesn't benefit from 4 parallel SCTPs the way
 	// datagram does (TCP serializes anyway), so 1 PC is plenty.
@@ -827,11 +827,11 @@ func runSend(args []string) {
 		idx := i
 		pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 			if c == nil {
-				fmt.Fprintf(os.Stderr, "[pc%d] ICE gathering done\n", idx)
+				dbgf("[pc%d] ICE gathering done\n", idx)
 				return
 			}
 			ci := c.ToJSON()
-			fmt.Fprintf(os.Stderr, "[pc%d] local cand: %s\n", idx, ci.Candidate)
+			dbgf("[pc%d] local cand: %s\n", idx, ci.Candidate)
 			rid, _ := remotePeerID.Load().(string)
 			if rid == "" {
 				return
@@ -839,10 +839,10 @@ func runSend(args []string) {
 			_ = ws.write(sigMsg{Type: "ice", To: rid, Candidate: &ci, PcIdx: ptr(idx)})
 		})
 		pc.OnICEConnectionStateChange(func(s webrtc.ICEConnectionState) {
-			fmt.Fprintf(os.Stderr, "[pc%d] ICE state: %s\n", idx, s.String())
+			dbgf("[pc%d] ICE state: %s\n", idx, s.String())
 		})
 		pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-			fmt.Fprintf(os.Stderr, "[pc%d] PC state: %s\n", idx, s.String())
+			dbgf("[pc%d] PC state: %s\n", idx, s.String())
 			if s == webrtc.PeerConnectionStateConnected {
 				everConnected[idx].Store(true)
 			}
@@ -990,7 +990,7 @@ func runSend(args []string) {
 			recvBitmapVer = m.Version
 			// Observed absorption rate: bytes newly acked per second between
 			// bitmap updates. This is the receiver telling us exactly how
-			// fast it can actually drink — the congestion controller clamps
+			// fast it can actually drink - the congestion controller clamps
 			// to it instead of hunting for it.
 			acked := countSetBits(bm)
 			now := time.Now()
@@ -1011,7 +1011,7 @@ func runSend(args []string) {
 			// receiver's explicit {type:"complete"} can be delayed by
 			// OPFS finalize (worker write queue drain on slow NAND) or
 			// lost if the control DC has issues, so don't depend on it
-			// alone — the bitmap is the truth.
+			// alone - the bitmap is the truth.
 			if countSetBits(bm) >= expectedChunks {
 				transferComplete.Store(true)
 			}
@@ -1035,15 +1035,15 @@ func runSend(args []string) {
 					fmt.Fprintf(os.Stderr, "[pc%d] SetLocalDescription error: %v\n", pcIdx, err)
 					return
 				}
-				fmt.Fprintf(os.Stderr, "[pc%d] sending offer to %s\n", pcIdx, peerID)
+				dbgf("[pc%d] sending offer to %s\n", pcIdx, peerID)
 				_ = ws.write(sigMsg{Type: "offer", To: peerID, SDP: &offer, PcIdx: ptr(pcIdx)})
 			}()
 		}
 	}
 	if ho != nil {
 		// The new receiver joined before this process existed, so no
-		// peer-joined will arrive for it — offer right away.
-		fmt.Printf("Receiver changed — restarting the transfer for the new receiver.\n")
+		// peer-joined will arrive for it - offer right away.
+		fmt.Printf("Receiver changed - restarting the transfer for the new receiver.\n")
 		sendOffers(ho.peer)
 	}
 
@@ -1058,7 +1058,7 @@ func runSend(args []string) {
 				if transferComplete.Load() || ws.closed.Load() {
 					return
 				}
-				fmt.Fprintf(os.Stderr, "[ws] signaling lost: %v — reconnecting\n", err)
+				fmt.Fprintf(os.Stderr, "[ws] signaling lost: %v - reconnecting\n", err)
 				if ws.reconnectWithBackoff(func() bool { return transferComplete.Load() }) {
 					continue
 				}
@@ -1075,15 +1075,15 @@ func runSend(args []string) {
 			if idx < 0 || idx >= effectivePCs {
 				idx = 0
 			}
-			fmt.Fprintf(os.Stderr, "[ws] recv type=%s peer=%s pcIdx=%d\n", msg.Type, msg.PeerID, idx)
+			dbgf("[ws] recv type=%s peer=%s pcIdx=%d\n", msg.Type, msg.PeerID, idx)
 			switch msg.Type {
 			case "joined":
 			case "hello":
-				// Receiver capability advertisement — arrives during ICE
+				// Receiver capability advertisement - arrives during ICE
 				// setup, well before we build the meta.
 				if h, ok := msg.Caps["chunkHint"]; ok && h >= 4096 && h <= 48*1024 {
 					peerChunkHint.Store(h)
-					fmt.Fprintf(os.Stderr, "[ws] receiver chunk hint: %d\n", h)
+					dbgf("[ws] receiver chunk hint: %d\n", h)
 				}
 			case "peer-joined":
 				if prev, _ := remotePeerID.Load().(string); prev != "" && prev != msg.PeerID {
@@ -1092,7 +1092,7 @@ func runSend(args []string) {
 					handoffToNewReceiver(handoff{room: room, key: keyBytes, token: peerToken, peer: msg.PeerID}, ws, pcs)
 					return
 				}
-				fmt.Fprintf(os.Stderr, "[ws] peer-joined → creating offer for %d pc(s)\n", len(pcs))
+				dbgf("[ws] peer-joined -> creating offer for %d pc(s)\n", len(pcs))
 				sendOffers(msg.PeerID)
 			case "answer":
 				if msg.SDP != nil && pcs[idx] != nil {
@@ -1104,11 +1104,11 @@ func runSend(args []string) {
 				}
 			case "peer-left":
 				// Not fatal: the receiver may be switching to the CLI (or
-				// reloading). Keep listening — a new peer-joined restarts
+				// reloading). Keep listening - a new peer-joined restarts
 				// the transfer for it; if nobody comes, the stall watchdog
 				// (or the 10-minute connect timeout) ends the wait.
 				if !transferComplete.Load() {
-					fmt.Fprintf(os.Stderr, "\nReceiver left — waiting for it (or a new receiver) to join...\n")
+					fmt.Fprintf(os.Stderr, "\nReceiver left - waiting for it (or a new receiver) to join...\n")
 				}
 			case "error":
 				select {
@@ -1135,9 +1135,12 @@ func runSend(args []string) {
 		}
 	}
 	fmt.Println("Connected, starting transfer.")
+	if r := describeRoute(pcs); r != "" {
+		fmt.Println(r)
+	}
 
 	// Adopt the receiver's chunk-size hint (WebKit receivers ask for bigger
-	// chunks — their per-message delivery cost dominates; +39% on iPad).
+	// chunks - their per-message delivery cost dominates; +39% on iPad).
 	// An explicit --chunk wins; relay keeps the default (reliable path).
 	if h := peerChunkHint.Load(); h > 0 && fl.chunkSize == 0 && !fl.relay {
 		sendChunkSize = h
@@ -1171,7 +1174,7 @@ func runSend(args []string) {
 		resumeBitmap = bm
 		setCount := countSetBits(resumeBitmap)
 		if setCount > 0 {
-			fmt.Printf("Receiver already has %d/%d chunks — resuming transfer\n", setCount, expectedChunks)
+			fmt.Printf("Receiver already has %d/%d chunks - resuming transfer\n", setCount, expectedChunks)
 		}
 	case <-time.After(resumeWaitTimeout):
 		// Fresh transfer (receiver doesn't support resume or has nothing).
@@ -1221,12 +1224,12 @@ func runSend(args []string) {
 			if r[0] > 0 && r[1] > 0 {
 				measured := float64(r[0]) / float64(r[1]) * 1000
 				cc.setRate(math.Min(measured*probeRateFactor, ccInitialCap))
-				fmt.Printf("Probe: %s/s measured → starting at %s/s (slow start)\n",
+				fmt.Printf("Probe: %s/s measured -> starting at %s/s (slow start)\n",
 					formatBytes(int64(measured)), formatBytes(int64(cc.getRate())))
 			}
 		case <-time.After(probeResultWait):
 			cc.setRate(ccInitialCap)
-			fmt.Println("Probe: no result — starting at slow-start cap")
+			fmt.Println("Probe: no result - starting at slow-start cap")
 		}
 	}
 
@@ -1284,9 +1287,9 @@ func runSend(args []string) {
 					if oerr == nil && pc.SetLocalDescription(offer) == nil {
 						rid, _ := remotePeerID.Load().(string)
 						if rid != "" && ws.write(sigMsg{Type: "offer", To: rid, SDP: pc.LocalDescription(), PcIdx: ptr(pcIdx)}) == nil {
-							fmt.Fprintf(os.Stderr, "[pc%d] ICE restart offer sent (attempt %d)\n", pcIdx, attempt)
+							dbgf("[pc%d] ICE restart offer sent (attempt %d)\n", pcIdx, attempt)
 						} else {
-							fmt.Fprintf(os.Stderr, "[pc%d] ICE restart waiting for signaling (attempt %d)\n", pcIdx, attempt)
+							dbgf("[pc%d] ICE restart waiting for signaling (attempt %d)\n", pcIdx, attempt)
 						}
 					} else if oerr != nil {
 						fmt.Fprintf(os.Stderr, "[pc%d] ICE restart offer failed: %v\n", pcIdx, oerr)
@@ -1297,7 +1300,7 @@ func runSend(args []string) {
 					case <-time.After(3 * time.Second):
 					}
 					if pc.ConnectionState() == webrtc.PeerConnectionStateConnected {
-						fmt.Fprintf(os.Stderr, "[pc%d] ICE restart succeeded\n", pcIdx)
+						dbgf("[pc%d] ICE restart succeeded\n", pcIdx)
 						return
 					}
 				}
@@ -1305,7 +1308,7 @@ func runSend(args []string) {
 		}
 	}()
 
-	// Stall watchdog: 30s without progress → kick ICE restarts on every PC
+	// Stall watchdog: 30s without progress -> kick ICE restarts on every PC
 	// (VPN toggles often surface as a silent stall before any state change
 	// fires). Only give up after stallHardTimeout of continued silence.
 	go func() {
@@ -1331,7 +1334,7 @@ func runSend(args []string) {
 				d := time.Since(stalledSince)
 				if d >= stallTimeout {
 					if !restartKicked {
-						fmt.Fprintf(os.Stderr, "\n[stall] no progress for %s — attempting to re-establish the connection (network change?)\n", stallTimeout)
+						fmt.Fprintf(os.Stderr, "\n[stall] no progress for %s - attempting to re-establish the connection (network change?)\n", stallTimeout)
 						restartKicked = true
 					}
 					for i := 0; i < effectivePCs; i++ {
@@ -1401,7 +1404,7 @@ func runSend(args []string) {
 
 	// ===== Phase F: AIMD on loss measured from the receiver's bitmap =====
 	// A chunk sent 1–3s ago that still isn't in the bitmap is presumed lost.
-	// <1% loss → rate ×1.1; >5% → ×0.8, with the non-congestive-loss guard:
+	// <1% loss -> rate ×1.1; >5% -> ×0.8, with the non-congestive-loss guard:
 	// 3 straight cuts that don't improve loss mean the loss is ambient
 	// (radio / random), so hold instead of death-spiraling to the floor.
 	ccDebug := os.Getenv("BEAMDROP_DEBUG") == "1"
@@ -1439,7 +1442,7 @@ func runSend(args []string) {
 				// off boundedly until it shows signs of life.
 				if ver == lastVer {
 					stallTicks++
-					// The receiver stopped reporting — it is busy draining a
+					// The receiver stopped reporting - it is busy draining a
 					// backlog, not gone. Drop ONCE to just under its observed
 					// absorption so the backlog shrinks, and only decay
 					// further if the silence drags on (5s+).
@@ -1454,7 +1457,7 @@ func runSend(args []string) {
 						if target < before {
 							cc.setRate(target)
 							if ccDebug {
-								fmt.Fprintf(os.Stderr, "[cc] receiver quiet (no bitmap %.1fs, drain %.1f) rate %.1f → %.1f MB/s\n",
+								fmt.Fprintf(os.Stderr, "[cc] receiver quiet (no bitmap %.1fs, drain %.1f) rate %.1f -> %.1f MB/s\n",
 									float64(stallTicks)*ccTickInterval.Seconds(), drain/1048576, before/1048576, cc.getRate()/1048576)
 							}
 						}
@@ -1482,7 +1485,7 @@ func runSend(args []string) {
 				// Judge loss at the PACKET level, not the chunk level. One
 				// lost UDP packet kills the whole chunk, so at 48KB (~41
 				// packets) a mere 2% radio packet loss reads as >50% chunk
-				// loss — which used to trip the hard-cut every tick and
+				// loss - which used to trip the hard-cut every tick and
 				// death-spiral the rate to the floor (observed on Pixel).
 				pktPerChunk := math.Max(1, float64(sendChunkSize+20)/1200)
 				loss := 1 - math.Pow(1-chunkLoss, 1/pktPerChunk)
@@ -1493,8 +1496,8 @@ func runSend(args []string) {
 						cc.setRate(before * ccSlowStartGrowth)
 					} else {
 						// Explore above the receiver's observed absorption,
-						// but not past ×1.35 of it — unbounded growth is what
-						// caused the 5→24MB/s sawtooth on CPU-bound
+						// but not past ×1.35 of it - unbounded growth is what
+						// caused the 5->24MB/s sawtooth on CPU-bound
 						// receivers (climb, backlog, quiet-freeze, deep cut).
 						next := before * 1.1
 						if drain > 0 && next > drain*1.35 {
@@ -1505,7 +1508,7 @@ func runSend(args []string) {
 					decreaseStreak = 0
 				case loss > 0.5:
 					slowStart = false
-					// Majority loss is never ambient radio noise — we are far
+					// Majority loss is never ambient radio noise - we are far
 					// above capacity (e.g. probe failed and we started
 					// uncapped). Halve without engaging the ambient-loss
 					// guard so we reach a sane rate in a few ticks.
@@ -1542,7 +1545,7 @@ func runSend(args []string) {
 				}
 				ccLastLossPct.Store(int64(loss * 1000))
 				if after := cc.getRate(); after != before && ccDebug {
-					fmt.Fprintf(os.Stderr, "[cc] pkt-loss %.2f%% (chunk %.1f%%, %d/%d) drain %.1f rate %.1f → %.1f MB/s\n",
+					fmt.Fprintf(os.Stderr, "[cc] pkt-loss %.2f%% (chunk %.1f%%, %d/%d) drain %.1f rate %.1f -> %.1f MB/s\n",
 						loss*100, chunkLoss*100, lost, sampled, drain/1048576, before/1048576, after/1048576)
 				}
 			}
@@ -1623,7 +1626,7 @@ func runSend(args []string) {
 			extra := ""
 			if cc.enabled {
 				// Only show the pacing rate while it is actually the
-				// constraint — past ~64MB/s it has grown out of the way and
+				// constraint - past ~64MB/s it has grown out of the way and
 				// the number would just race upward meaninglessly.
 				if r := cc.getRate(); r < 64*1048576 {
 					extra += fmt.Sprintf("  cc %.1f", r/1048576)
@@ -1710,7 +1713,7 @@ func runSend(args []string) {
 	// bufferedHigh-based throttle in sendChunk fires almost never and the
 	// 4 workers dump megabytes into downstream buffers in seconds (which
 	// then triggers carrier congestion, the 'starts fast, dies fast'
-	// cellular pattern). Bound it with a bitmap-derived window — same
+	// cellular pattern). Bound it with a bitmap-derived window - same
 	// idea as TCP's send window. Only enable on relay; on direct UDP path
 	// pion's SCTP-level bufferedAmount throttle in sendChunk is sufficient.
 	waitInflight := func(seq uint32) {
@@ -1795,11 +1798,11 @@ func runSend(args []string) {
 		fmt.Fprintln(os.Stderr)
 		ab, _ := json.Marshal(map[string]any{"type": "abort", "reason": reason})
 		_ = controlDC.SendText(string(ab))
-		die(fmt.Errorf("transfer aborted: %s (try again — if it keeps happening, check WiFi or use a wired connection)", reason))
+		die(fmt.Errorf("transfer aborted: %s (try again - if it keeps happening, check WiFi or use a wired connection)", reason))
 	default:
 	}
 
-	// Phase 1 done — tell receiver and include fileHash for end-to-end verify.
+	// Phase 1 done - tell receiver and include fileHash for end-to-end verify.
 	finalHash, _ := fileHash.Load().(string)
 	doneMsg := map[string]any{"type": "done"}
 	if finalHash != "" {
@@ -1812,7 +1815,7 @@ func runSend(args []string) {
 	//
 	// We retransmit in *small* batches (retransmitBatchLimit chunks per pass)
 	// so the receiver can drain its decrypt+store queue and refresh its
-	// bitmap between passes. Otherwise — observed in v0.2.0 — the sender
+	// bitmap between passes. Otherwise - observed in v0.2.0 - the sender
 	// floods the receiver with all "missing" chunks, the bitmap stays stale
 	// for seconds, and the next pass repeats almost the same set, ballooning
 	// total bytes pushed to many multiples of the file size.
@@ -1824,7 +1827,7 @@ func runSend(args []string) {
 	//     hammer a permanently-broken DC for minutes).
 	// Adaptive interval + batch size: when the receiver's bitmap doesn't
 	// advance much between passes (delivery ratio < 10%), exponentially
-	// back off the wait time and shrink the batch — classic congestion
+	// back off the wait time and shrink the batch - classic congestion
 	// avoidance, mirrors what TCP does on RTO. When the receiver catches
 	// up (delivery ratio > 50%), reset to base. This stops the retransmit
 	// storm where, on lossy links, our own resends compound the loss and
@@ -1865,7 +1868,7 @@ func runSend(args []string) {
 			}
 			ratio := float64(landed) / float64(prevAttempted)
 			if ratio < 0.1 {
-				// Almost nothing landed — back off.
+				// Almost nothing landed - back off.
 				curInterval *= 2
 				if curInterval > maxRetransmitInterval {
 					curInterval = maxRetransmitInterval
@@ -1875,7 +1878,7 @@ func runSend(args []string) {
 					curBatchLimit = retransmitBatchMin
 				}
 			} else if ratio > 0.5 {
-				// Receiver is keeping up — return to base pacing.
+				// Receiver is keeping up - return to base pacing.
 				curInterval = retransmitInterval
 				curBatchLimit = retransmitBatchLimit
 			}
@@ -1901,7 +1904,7 @@ func runSend(args []string) {
 			if stagnant >= stagnantPassThreshold {
 				ab, _ := json.Marshal(map[string]any{"type": "abort", "reason": "no receiver progress for too many retransmit passes"})
 				_ = controlDC.SendText(string(ab))
-				die(fmt.Errorf("retransmit stagnated: receiver stopped acknowledging (%d/%d chunks). The receiver may have run out of disk space or crashed — check its terminal/screen", curReceivedBits, expectedChunks))
+				die(fmt.Errorf("retransmit stagnated: receiver stopped acknowledging (%d/%d chunks). The receiver may have run out of disk space or crashed - check its terminal/screen", curReceivedBits, expectedChunks))
 			}
 		} else {
 			stagnant = 0
@@ -1943,7 +1946,7 @@ func runSend(args []string) {
 	}
 
 	// Drain remaining DC buffers so the wire delivery completes. Include
-	// the retransmit DC — its reliable mode means lingering bytes are
+	// the retransmit DC - its reliable mode means lingering bytes are
 	// still being acked by SCTP and we want them to land before exit.
 	drainStart := time.Now()
 	for {
@@ -1970,10 +1973,10 @@ func runSend(args []string) {
 	}
 	if !transferComplete.Load() {
 		fmt.Fprintln(os.Stderr)
-		die(fmt.Errorf("retransmit limit reached or timeout — receiver did not confirm completion"))
+		die(fmt.Errorf("retransmit limit reached or timeout - receiver did not confirm completion"))
 	}
 
-	// Land the progress bar on 100% before printing Done — without this,
+	// Land the progress bar on 100% before printing Done - without this,
 	// the bar can be stuck at e.g. 99.1% if the last sendChunk update
 	// happened just before the receiver's "complete" landed.
 	fmt.Printf("\r  %s 100.0%%  %s/%s                                              \n",
@@ -2128,6 +2131,11 @@ func runRecv(args []string) {
 		return true
 	}
 
+	// bitmapVersion orders bitmap reports; shared by the periodic reporter
+	// and the final report in finishIfComplete (both run under stMu).
+	var bitmapVersion int64
+	routeShown := false
+
 	finishIfComplete := func() {
 		if finished || !gotMeta || outFile == nil {
 			return
@@ -2136,11 +2144,27 @@ func runRecv(args []string) {
 			return
 		}
 		finished = true
+		// Report the full bitmap NOW. The periodic reporter stops once we
+		// are finished and "complete" is only sent after the SHA-256 pass
+		// (seconds on a big file); until then the sender held a bitmap up
+		// to 200ms stale, saw the last few dozen chunks as missing and ran
+		// pointless retransmit passes - or gave up with "stagnated".
+		if dc, ok := controlDC.Load().(*webrtc.DataChannel); ok && dc != nil {
+			bitmapVersion++
+			final, _ := json.Marshal(map[string]any{
+				"type":     "bitmap",
+				"version":  bitmapVersion,
+				"received": receivedCount,
+				"data":     b64URL.EncodeToString(recvBitmap),
+				"fileIdx":  currentFileIdx,
+			})
+			_ = dc.SendText(string(final))
+		}
 		_ = outFile.Sync()
 		_ = outFile.Close()
 		outFile = nil
 
-		// Land the progress bar on 100% — the per-chunk Printf is throttled
+		// Land the progress bar on 100% - the per-chunk Printf is throttled
 		// to 500ms and may have last drawn at e.g. 94% when the final batch
 		// of chunks landed in one tick.
 		fmt.Printf("\r  %s 100.0%%  %s/%s                                              \n",
@@ -2155,7 +2179,7 @@ func runRecv(args []string) {
 				fmt.Fprintf(os.Stderr, "warn: hash %s: %v\n", partPath, herr)
 			} else if got != expectedHash {
 				select {
-				case transferDone <- fmt.Errorf("checksum mismatch: expected %s, got %s — partial kept at %s",
+				case transferDone <- fmt.Errorf("checksum mismatch: expected %s, got %s - partial kept at %s",
 					shortHash(expectedHash), shortHash(got), partPath):
 				default:
 				}
@@ -2178,7 +2202,7 @@ func runRecv(args []string) {
 			_ = dc.SendText(string(ack))
 		}
 		if currentFileIdx < fileCount-1 {
-			// More batch files coming — stay alive and wait for the next meta.
+			// More batch files coming - stay alive and wait for the next meta.
 			fmt.Printf("File %d/%d received, waiting for next...\n", currentFileIdx+1, fileCount)
 			return
 		}
@@ -2213,7 +2237,7 @@ func runRecv(args []string) {
 		}
 		// Prefix matches. Assume contiguous chunks 0..K-1 are valid where
 		// K = floor(partSize / chunkSize). The trailing partial chunk (if
-		// any) is discarded — it's safer to re-receive than to half-trust.
+		// any) is discarded - it's safer to re-receive than to half-trust.
 		fullChunks := int(st.Size() / metaChunkSize)
 		if fullChunks > metaChunks {
 			fullChunks = metaChunks
@@ -2360,6 +2384,15 @@ func runRecv(args []string) {
 				fmt.Printf("Resuming %q (%d/%d chunks already on disk)%s\n", metaName, alreadyHave, metaChunks, batchLabel)
 			} else {
 				fmt.Printf("Receiving %q (%s, %d chunks, v%d)%s\n", metaName, formatBytes(metaSize), metaChunks, m.ProtocolVersion, batchLabel)
+				if !routeShown {
+					routeShown = true
+					pcsMu.Lock()
+					r := describeRoute(pcs)
+					pcsMu.Unlock()
+					if r != "" {
+						fmt.Println(r)
+					}
+				}
 			}
 
 			// Send "resume" with our current bitmap so the sender can skip
@@ -2398,7 +2431,7 @@ func runRecv(args []string) {
 			probeTLast = time.Time{}
 			stMu.Unlock()
 		case "probe-end":
-			// Data DCs are unordered relative to control — give in-flight
+			// Data DCs are unordered relative to control - give in-flight
 			// probe frames a moment to land before reporting.
 			go func() {
 				time.Sleep(150 * time.Millisecond)
@@ -2519,11 +2552,10 @@ func runRecv(args []string) {
 		return pc, nil
 	}
 
-	// Bitmap reporter — every 200ms send current bitmap on the control DC.
+	// Bitmap reporter - every 200ms send current bitmap on the control DC.
 	go func() {
 		ticker := time.NewTicker(bitmapInterval)
 		defer ticker.Stop()
-		var version int64
 		for range ticker.C {
 			stMu.Lock()
 			if finished && currentFileIdx >= fileCount-1 {
@@ -2536,10 +2568,10 @@ func runRecv(args []string) {
 				stMu.Unlock()
 				continue
 			}
-			version++
+			bitmapVersion++
 			payload, _ := json.Marshal(map[string]any{
 				"type":     "bitmap",
-				"version":  version,
+				"version":  bitmapVersion,
 				"received": receivedCount,
 				"data":     b64URL.EncodeToString(recvBitmap),
 				"fileIdx":  currentFileIdx,
@@ -2564,7 +2596,7 @@ func runRecv(args []string) {
 				if done {
 					return
 				}
-				fmt.Fprintf(os.Stderr, "[ws] signaling lost: %v — reconnecting\n", err)
+				fmt.Fprintf(os.Stderr, "[ws] signaling lost: %v - reconnecting\n", err)
 				if ws.reconnectWithBackoff(nil) {
 					continue
 				}
@@ -2654,7 +2686,7 @@ func runRecv(args []string) {
 			case "error":
 				// Taking over from a browser tab (beamdrop:// link): the tab
 				// has left, but the server holds its slot for a reconnect
-				// grace period. Keep knocking — the socket was closed on us,
+				// grace period. Keep knocking - the socket was closed on us,
 				// so the next read fails and re-dials.
 				if msg.Reason == "room_full" && waitForRoom && roomFullTries < 60 {
 					if roomFullTries == 0 {
@@ -2734,7 +2766,7 @@ func checkForUpdate() {
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "[beamdrop] update available: %s → %s — run: beamdrop update\n", Version, latest)
+	fmt.Fprintf(os.Stderr, "[beamdrop] update available: %s -> %s - run: beamdrop update\n", Version, latest)
 	fmt.Fprintln(os.Stderr, "  (set BEAMDROP_NO_UPDATE_CHECK=1 to silence)")
 	fmt.Fprintln(os.Stderr)
 }
@@ -2809,7 +2841,7 @@ func runUpdate() {
 		die(fmt.Errorf("install: %w", err))
 	}
 
-	fmt.Printf("Updated %s → %s\n", Version, latest)
+	fmt.Printf("Updated %s -> %s\n", Version, latest)
 }
 
 func downloadTo(url, dest string) error {
@@ -2890,23 +2922,32 @@ const installSh = "https://raw.githubusercontent.com/s-saga011/beamdrop-cli/main
 const installPs1 = "https://raw.githubusercontent.com/s-saga011/beamdrop-cli/main/install.ps1"
 
 func printShareInstructions(room, shareURL string) {
+	top, side, bottom := "┌─ Share with the recipient ──────────────────────────────────────", "│", "└──────────────────────────────────────────────────────────────────"
+	if asciiUI {
+		top, side, bottom = "+-- Share with the recipient -------------------------------------", "|", "+-----------------------------------------------------------------"
+	}
 	fmt.Println()
-	fmt.Println("┌─ Share with the recipient ──────────────────────────────────────")
-	fmt.Println("│")
-	fmt.Println("│  Full URL (works in any browser, includes E2E key):")
-	fmt.Printf("│    %s\n", shareURL)
-	fmt.Println("│")
-	fmt.Println("│  macOS / Linux CLI (auto-installs if missing):")
-	fmt.Printf("│    curl -fsSL %s | sh -s -- recv '%s'\n", installSh, shareURL)
-	fmt.Println("│")
-	fmt.Println("│  Windows PowerShell CLI (auto-installs if missing):")
-	fmt.Printf("│    & ([scriptblock]::Create((irm %s))) recv '%s'\n", installPs1, shareURL)
-	fmt.Println("│")
-	fmt.Println("│  Already installed — update first, then receive:")
-	fmt.Printf("│    beamdrop update && beamdrop recv '%s'\n", shareURL)
-	fmt.Println("└──────────────────────────────────────────────────────────────────")
+	fmt.Println(top)
+	fmt.Println(side)
+	fmt.Println(side + "  Full URL (works in any browser, includes E2E key):")
+	fmt.Printf("%s    %s\n", side, shareURL)
+	fmt.Println(side)
+	fmt.Println(side + "  macOS / Linux CLI (auto-installs if missing):")
+	fmt.Printf("%s    curl -fsSL %s | sh -s -- recv '%s'\n", side, installSh, shareURL)
+	fmt.Println(side)
+	fmt.Println(side + "  Windows PowerShell CLI (auto-installs if missing):")
+	fmt.Printf("%s    & ([scriptblock]::Create((irm %s))) recv '%s'\n", side, installPs1, shareURL)
+	fmt.Println(side)
+	fmt.Println(side + "  Already installed - update first, then receive:")
+	fmt.Printf("%s    beamdrop update && beamdrop recv '%s'\n", side, shareURL)
+	fmt.Println(bottom)
 	fmt.Println()
-	qrterminal.GenerateHalfBlock(shareURL, qrterminal.L, os.Stdout)
+	if asciiUI {
+		// A QR code needs block characters; in ASCII it would not scan.
+		fmt.Println("(QR code not shown: this console cannot draw it. Windows Terminal can.)")
+	} else {
+		qrterminal.GenerateHalfBlock(shareURL, qrterminal.L, os.Stdout)
+	}
 	fmt.Println()
 	_ = room
 }
@@ -2922,7 +2963,11 @@ func progressBar(pct float64, width int) string {
 	if filled > width {
 		filled = width
 	}
-	return "[" + strings.Repeat("█", filled) + strings.Repeat("░", width-filled) + "]"
+	full, empty := "█", "░"
+	if asciiUI {
+		full, empty = "#", "-"
+	}
+	return "[" + strings.Repeat(full, filled) + strings.Repeat(empty, width-filled) + "]"
 }
 
 func formatBytes(n int64) string {

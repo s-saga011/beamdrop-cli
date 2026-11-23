@@ -93,7 +93,7 @@ func runOpen(args []string) {
 	if err := os.Chdir(dir); err != nil {
 		die(fmt.Errorf("cannot enter %s: %w", dir, err))
 	}
-	fmt.Printf("beamdrop %s — receiving into %s\n\n", Version, dir)
+	fmt.Printf("beamdrop %s - receiving into %s\n\n", Version, dir)
 	runRecv([]string{share})
 	holdWindowIfNeeded()
 }
