@@ -2,13 +2,16 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // beamdrop:// links let the web receiver page hand a transfer to an installed
@@ -96,6 +99,8 @@ func runOpen(args []string) {
 		die(fmt.Errorf("usage: beamdrop open beamdrop://HOST/r/ROOM#k=KEY"))
 	}
 	args[0] = stripPastedQuotes(args[0])
+	announceLinkLaunch(args[0])
+	autoUpdateForLink()
 	if strings.Contains(args[0], "/s/") {
 		runOpenSend(args[0])
 		return
@@ -150,4 +155,83 @@ func runRegister(args []string) {
 		die(fmt.Errorf("could not register beamdrop:// links: %w", err))
 	}
 	fmt.Printf("beamdrop:// links now open with %s\n", exe)
+}
+
+// autoUpdateForLink brings the CLI up to the latest release before a link
+// launch does its work. Link launches come from the web page, which is always
+// the newest version and may rely on things an old CLI does not know (a
+// v0.8.3 CLI could not find a deeply nested file that v0.8.6 finds at once),
+// and nobody thinks of running `beamdrop update` first. Best effort: any
+// failure just continues with the installed version. The other side waits
+// minutes for us, so the few seconds a download takes are fine.
+// BEAMDROP_NO_AUTOUPDATE=1 (or BEAMDROP_NO_UPDATE_CHECK=1) turns it off.
+func autoUpdateForLink() {
+	if os.Getenv("BEAMDROP_NO_AUTOUPDATE") == "1" || os.Getenv("BEAMDROP_NO_UPDATE_CHECK") == "1" ||
+		os.Getenv("BEAMDROP_UPDATED") == "1" || strings.Contains(Version, "-") {
+		return // opted out, just updated, or a dev build
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("https://api.github.com/repos/s-saga011/beamdrop-cli/releases/latest")
+	if err != nil {
+		return
+	}
+	var rel struct {
+		TagName string `json:"tag_name"`
+	}
+	derr := json.NewDecoder(resp.Body).Decode(&rel)
+	resp.Body.Close()
+	latest := strings.TrimSpace(rel.TagName)
+	if derr != nil || resp.StatusCode != 200 || latest == "" || !versionLess(Version, latest) {
+		return
+	}
+	exePath, err := os.Executable()
+	if err != nil {
+		return
+	}
+	if r, err := filepath.EvalSymlinks(exePath); err == nil {
+		exePath = r
+	}
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+	url := fmt.Sprintf("https://github.com/s-saga011/beamdrop-cli/releases/download/%s/beamdrop-%s-%s%s", latest, runtime.GOOS, runtime.GOARCH, ext)
+	fmt.Printf("Updating beamdrop %s -> %s first...\n", Version, latest)
+	tmp := exePath + ".new"
+	_ = os.Remove(tmp)
+	if err := downloadTo(url, tmp); err != nil {
+		_ = os.Remove(tmp)
+		fmt.Printf("Update skipped (%v) - continuing with %s.\n", err, Version)
+		return
+	}
+	if err := atomicReplaceBinary(exePath, tmp); err != nil {
+		_ = os.Remove(tmp)
+		fmt.Printf("Update skipped (%v) - continuing with %s.\n", err, Version)
+		return
+	}
+	// Run the new binary with the same arguments; the marker prevents a loop
+	// if the release somehow still reports an older version.
+	if err := reexec(append(os.Environ(), "BEAMDROP_UPDATED=1")); err != nil {
+		fmt.Printf("Updated to %s, but could not restart (%v) - continuing with %s.\n", latest, err, Version)
+	}
+}
+
+var linkRoomRe = regexp.MustCompile(`^beamdrop://([A-Za-z0-9.-]{1,253}(?::[0-9]{1,5})?)/[rs]/([A-Za-z0-9_-]{1,64})[?#]`)
+
+// announceLinkLaunch tells the signaling server "the app started for this
+// room". The web page that opened the link has left the room and cannot see
+// us; it polls for this so it can say "handed off" instead of guessing, or -
+// when nothing arrives - switch to the install instructions. Sent first,
+// before the self-update and (for sends) the file search and y/N prompt,
+// which can take a while. Best effort, trusted hosts only.
+func announceLinkLaunch(link string) {
+	m := linkRoomRe.FindStringSubmatch(link)
+	if m == nil || !linkAllowedHosts()[m[1]] {
+		return
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Post(linkServerURL(m[1])+"/api/rooms/"+m[2]+"/app", "application/json", nil)
+	if err == nil {
+		resp.Body.Close()
+	}
 }
