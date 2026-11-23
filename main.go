@@ -1010,6 +1010,8 @@ func runSend(args []string) {
 	var resumeDelivered atomic.Bool
 	var peerProbeCap atomic.Bool
 	var peerWantsReliable atomic.Bool // receiver asked for reliable data channels
+	var peerWantsWT atomic.Bool       // receiver can take the chunks over WebTransport (wt.go)
+	wtReplyCh := make(chan wtReply, 1)
 	probeResultCh := make(chan [2]int64, 1) // {bytesReceived, durationMs}
 
 	controlDC.OnMessage(func(msg webrtc.DataChannelMessage) {
@@ -1024,17 +1026,27 @@ func runSend(args []string) {
 			Caps          map[string]int `json:"caps"`
 			BytesReceived int64          `json:"bytesReceived"`
 			DurationMs    int64          `json:"durationMs"`
+			I             int            `json:"i"`
+			Reason        string         `json:"reason"`
 		}
 		if err := json.Unmarshal(msg.Data, &m); err != nil {
 			return
 		}
 		switch m.Type {
+		case "wt-ready", "wt-fail":
+			select {
+			case wtReplyCh <- wtReply{ok: m.Type == "wt-ready", idx: m.I, reason: m.Reason}:
+			default:
+			}
 		case "resume":
 			if m.Caps["probe"] == 1 {
 				peerProbeCap.Store(true)
 			}
 			if m.Caps["reliable"] == 1 {
 				peerWantsReliable.Store(true)
+			}
+			if m.Caps["wt"] == 1 {
+				peerWantsWT.Store(true)
 			}
 			if resumeDelivered.Swap(true) {
 				return
@@ -1181,6 +1193,9 @@ func runSend(args []string) {
 				if msg.Caps["reliable"] == 1 {
 					peerWantsReliable.Store(true)
 				}
+				if msg.Caps["wt"] == 1 {
+					peerWantsWT.Store(true)
+				}
 			case "peer-joined":
 				if prev, _ := remotePeerID.Load().(string); prev != "" && prev != msg.PeerID {
 					// A different receiver took over the room. Everything
@@ -1284,6 +1299,17 @@ func runSend(args []string) {
 		// Fresh transfer (receiver doesn't support resume or has nothing).
 	}
 
+	// WebTransport data path (wt.go): a browser receiver on the local network
+	// gets the chunks over QUIC instead of the DataChannels. Offered only
+	// when it advertised caps.wt and the route is local; if it cannot
+	// connect within a few seconds we carry on exactly as before.
+	// BEAMDROP_WT=0 disables it, =1 offers it regardless of the route.
+	var wt *wtSender
+	if wtEnv := os.Getenv("BEAMDROP_WT"); !fl.relay && len(relDCs) > 0 && wtEnv != "0" && peerWantsWT.Load() &&
+		(wtEnv == "1" || routeIsLocal(pcs)) {
+		wt = negotiateWT(pcs, controlDC, wtReplyCh, transferComplete.Load)
+	}
+
 	// ===== Phase E: bandwidth probe (datagram path only) =====
 	// Blast dummy frames for ~1.2s, let the receiver count what actually
 	// arrives, and start Phase 1 at 80% of that. Only when the receiver
@@ -1294,7 +1320,13 @@ func runSend(args []string) {
 	// crawl, which is exactly what the datagram mode exists to avoid.
 	// BEAMDROP_RELIABLE=1 / =0 forces it either way.
 	useReliable := false
-	if len(relDCs) > 0 {
+	if wt != nil {
+		defer wt.srv.close()
+		// No congestion control, probe or extra connections: QUIC does its
+		// own. The reliable channels stand by in case the session dies.
+		dataDCs, bufLow = relDCs, relBufLow
+		fmt.Println("Mode: WebTransport (browser receiver, local route)")
+	} else if len(relDCs) > 0 {
 		switch os.Getenv("BEAMDROP_RELIABLE") {
 		case "1":
 			useReliable = true
@@ -1377,7 +1409,7 @@ func runSend(args []string) {
 			}
 		}
 	}
-	cc := newCC(!fl.relay && !useReliable)
+	cc := newCC(!fl.relay && !useReliable && wt == nil)
 	sendTimes := make([]int64, expectedChunks) // unix ms of last send per seq (atomic)
 	if cc.enabled && peerProbeCap.Load() && totalBytes >= probeMinFileSize {
 		ps, _ := json.Marshal(map[string]any{"type": "probe-start", "durationMs": probeDurationMS})
@@ -1744,6 +1776,7 @@ func runSend(args []string) {
 		}()
 	}
 
+	var reportProgress func()
 	sendChunk := func(dc *webrtc.DataChannel, ch chan struct{}, seq uint32, plaintext []byte) error {
 		ct := encryptChunk(aead, plaintext, seq, 0) // CLI send is single-file (fileIdx 0)
 		out := make([]byte, seqHeaderBytes+len(ct))
@@ -1774,7 +1807,10 @@ func runSend(args []string) {
 			atomic.StoreInt64(&sendTimes[seq], time.Now().UnixMilli())
 		}
 		bytesPushed.Add(int64(len(plaintext)))
-
+		reportProgress()
+		return nil
+	}
+	reportProgress = func() {
 		now := time.Now()
 		lastReportMu.Lock()
 		shouldReport := now.Sub(lastReport) > 500*time.Millisecond
@@ -1838,7 +1874,6 @@ func runSend(args []string) {
 			fmt.Printf("\r  %s %5.1f%%  %s/%s  %.1f MB/s%s\x1b[K",
 				progressBar(pct, 30), pct, formatBytes(ackedBytes), formatBytes(totalBytes), rate, extra)
 		}
-		return nil
 	}
 
 	type chunkData struct {
@@ -1955,6 +1990,24 @@ func runSend(args []string) {
 		}()
 	}
 
+	if wt != nil {
+		go func() { // an abort must unblock stream writes
+			<-abortSig
+			wt.srv.close()
+		}()
+		err := wt.send(
+			func() (uint32, []byte, bool) { cd, ok := <-chunks; return cd.seq, cd.pt, ok },
+			func(seq uint32, pt []byte) []byte { return encryptChunk(aead, pt, seq, 0) },
+			func(n int) { bytesPushed.Add(int64(n)); reportProgress() },
+			transferComplete.Load)
+		if err != nil && !transferComplete.Load() {
+			// The workers below take over on the reliable channels; whatever
+			// was in flight is re-sent by the retransmit phase.
+			fmt.Fprintf(os.Stderr, "\nWebTransport session lost - continuing over the data channels\n")
+			dbgf("[wt] %v\n", err)
+		}
+	}
+
 	var wg sync.WaitGroup
 	for i := 0; i < len(dataDCs); i++ {
 		wg.Add(1)
@@ -2007,6 +2060,22 @@ func runSend(args []string) {
 	}
 	doneJSON, _ := json.Marshal(doneMsg)
 	_ = controlDC.SendText(string(doneJSON))
+
+	// WebTransport: everything is written, but the receiver is still
+	// draining its QUIC buffers. Let its bitmap catch up before Phase 2
+	// decides those chunks are missing and re-sends them the slow way.
+	if wt.alive() {
+		last, lastChange := -1, time.Now()
+		for wt.alive() && !transferComplete.Load() && !receiverGone.Load() && time.Since(lastChange) < 3*time.Second {
+			time.Sleep(50 * time.Millisecond)
+			recvBitmapMu.Lock()
+			n := lastAckCount
+			recvBitmapMu.Unlock()
+			if n != last {
+				last, lastChange = n, time.Now()
+			}
+		}
+	}
 
 	// Phase 2: bitmap-driven retransmit.
 	//
