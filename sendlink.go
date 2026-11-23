@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"io/fs"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -127,7 +129,27 @@ func checkSendCandidate(path string, sl sendLink) error {
 // rest of the home directory. Bounded in depth and time; the first candidate
 // whose name, size and hashes all match wins.
 func locateSendFile(sl sendLink) string {
-	deadline := time.Now().Add(5 * time.Second)
+	home, _ := os.UserHomeDir()
+	// macOS: ask Spotlight first. It knows every file under the home
+	// directory by name instantly, however deep - the directory walk below
+	// gave up on a file 8 folders down (~/work/.../data/speclib/x.json).
+	if runtime.GOOS == "darwin" && home != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		q := `kMDItemFSName == "` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(sl.name) + `"`
+		out, err := exec.CommandContext(ctx, "mdfind", "-onlyin", home, q).Output()
+		cancel()
+		if err == nil {
+			for _, p := range strings.Split(string(out), "\n") {
+				if p = strings.TrimSpace(p); p == "" || !strings.HasPrefix(p, home+string(filepath.Separator)) {
+					continue
+				}
+				if checkSendCandidate(p, sl) == nil {
+					return p
+				}
+			}
+		}
+	}
+	deadline := time.Now().Add(6 * time.Second)
 	done := map[string]bool{}
 	search := func(root string, maxDepth int) string {
 		root = filepath.Clean(root)
@@ -171,7 +193,6 @@ func locateSendFile(sl sendLink) string {
 		done[root] = true
 		return found
 	}
-	home, _ := os.UserHomeDir()
 	if cwd, err := os.Getwd(); err == nil && cwd != home && filepath.Dir(cwd) != cwd {
 		if p := search(cwd, 1); p != "" {
 			return p
@@ -185,7 +206,9 @@ func locateSendFile(sl sendLink) string {
 			return p
 		}
 	}
-	return search(home, 5)
+	// The time budget is the real bound; the depth cap only stops runaway
+	// trees. 5 was too shallow for ordinary project folders.
+	return search(home, 12)
 }
 
 // cleanPastedPath undoes what a terminal does to a dragged-in file: wraps it
