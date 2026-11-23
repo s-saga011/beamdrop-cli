@@ -43,7 +43,9 @@ import (
 	"io"
 	"math"
 	"math/bits"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -534,6 +536,44 @@ func parseFlags(args []string) flags {
 	return out
 }
 
+// tailscaleULA is the IPv6 prefix Tailscale assigns to every node; an
+// interface carrying one of these addresses is the Tailscale tunnel.
+var tailscaleULA = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+
+// newDirectAPI returns a UDP-only *webrtc.API that does not gather ICE
+// candidates on Tailscale interfaces. pion gives every host candidate the
+// same priority, so with both peers on one tailnet ICE happily nominates the
+// tunnel pair even on a shared LAN — measured CLI→CLI 12MB/s (1GB, bursts of
+// 8% loss) through the tunnel vs. 43-80MB/s on the same 2.5GbE LAN direct.
+// Set BEAMDROP_ALLOW_TAILSCALE=1 to keep the old behaviour.
+func newDirectAPI() *webrtc.API {
+	if os.Getenv("BEAMDROP_ALLOW_TAILSCALE") == "1" {
+		return webrtc.NewAPI()
+	}
+	skip := map[string]bool{}
+	if ifs, err := net.Interfaces(); err == nil {
+		for _, ifc := range ifs {
+			if strings.Contains(strings.ToLower(ifc.Name), "tailscale") {
+				skip[ifc.Name] = true
+				continue
+			}
+			addrs, _ := ifc.Addrs()
+			for _, a := range addrs {
+				if p, err := netip.ParsePrefix(a.String()); err == nil && tailscaleULA.Contains(p.Addr()) {
+					skip[ifc.Name] = true
+					break
+				}
+			}
+		}
+	}
+	if len(skip) == 0 {
+		return webrtc.NewAPI()
+	}
+	se := webrtc.SettingEngine{}
+	se.SetInterfaceFilter(func(name string) bool { return !skip[name] })
+	return webrtc.NewAPI(webrtc.WithSettingEngine(se))
+}
+
 // newRelayAPI returns a *webrtc.API whose ICE agent gathers TCP candidates.
 // pion v4 defaults to UDP-only network types, which silently drops every
 // turn:host:port?transport=tcp / turns:host:443 URL on the floor (the
@@ -717,7 +757,7 @@ func runSend(args []string) {
 		iceServers = []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}
 	}
 	pcConfig := webrtc.Configuration{ICEServers: iceServers}
-	pcAPI := webrtc.NewAPI() // default UDP-only — fine for direct/UDP-TURN paths
+	pcAPI := newDirectAPI() // UDP-only, skips Tailscale — fine for direct/UDP-TURN paths
 	if fl.relay {
 		filtered := filterRelayTLS(iceServers)
 		if len(filtered) == 0 {
@@ -1955,7 +1995,7 @@ func runRecv(args []string) {
 	}
 	relayOn := fl.relay || st.relay
 	pcConfig := webrtc.Configuration{ICEServers: iceServers}
-	pcAPI := webrtc.NewAPI()
+	pcAPI := newDirectAPI()
 	if relayOn {
 		filtered := filterRelayTLS(iceServers)
 		if len(filtered) == 0 {
