@@ -63,7 +63,7 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.8.5"
+var Version = "v0.8.6"
 
 const (
 	chunkSize           = 16 * 1024
