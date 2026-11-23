@@ -95,6 +95,7 @@ func runOpen(args []string) {
 	if len(args) != 1 {
 		die(fmt.Errorf("usage: beamdrop open beamdrop://HOST/r/ROOM#k=KEY"))
 	}
+	args[0] = stripPastedQuotes(args[0])
 	if strings.Contains(args[0], "/s/") {
 		runOpenSend(args[0])
 		return

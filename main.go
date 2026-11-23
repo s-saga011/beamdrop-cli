@@ -194,7 +194,16 @@ func parseFragmentParams(frag string) map[string]string {
 	return out
 }
 
+// stripPastedQuotes removes quote characters left around a pasted link.
+// Chat and notes apps turn '...' into typographic quotes, which the shell
+// then passes through as part of the argument - the key picked up a trailing
+// quote and failed to decode ("illegal base64 data at input byte 43").
+func stripPastedQuotes(s string) string {
+	return strings.Trim(strings.TrimSpace(s), "'\"\u2018\u2019\u201c\u201d\u00ab\u00bb`")
+}
+
 func parseShareTarget(arg, fallbackServer string) (shareTarget, error) {
+	arg = stripPastedQuotes(arg)
 	out := shareTarget{server: fallbackServer}
 	applyFrag := func(frag string) {
 		params := parseFragmentParams(frag)
@@ -906,6 +915,36 @@ func runSend(args []string) {
 		})
 		dataDCs[idx] = dc
 	}
+	// A second, reliable+ordered set of data channels ("rel-N"). Browser
+	// receivers do far better on these: a 16KB chunk is ~14 packets and on
+	// a datagram channel one lost packet voids it, which made Chrome
+	// receivers saw-tooth at well under half their capacity (measured
+	// CLI -> Chrome on a Mac: 6.8 MB/s datagram vs 33.5 MB/s reliable, zero
+	// retransmit overhead). Which set to use is decided once the receiver's
+	// capabilities and the route are known; the idle set costs nothing.
+	// Receivers treat any non-"control" channel as data, old ones included.
+	var relDCs []*webrtc.DataChannel
+	var relBufLow []chan struct{}
+	if !fl.relay {
+		relDCs = make([]*webrtc.DataChannel, effectivePCs)
+		relBufLow = make([]chan struct{}, effectivePCs)
+		for i, pc := range pcs {
+			dc, err := pc.CreateDataChannel(fmt.Sprintf("rel-%d", i), &webrtc.DataChannelInit{Ordered: ptr(true)})
+			if err != nil {
+				die(err)
+			}
+			dc.SetBufferedAmountLowThreshold(bufferedLow)
+			ch := make(chan struct{}, 1)
+			relBufLow[i] = ch
+			dc.OnBufferedAmountLow(func() {
+				select {
+				case ch <- struct{}{}:
+				default:
+				}
+			})
+			relDCs[i] = dc
+		}
+	}
 	controlDC, err := pcs[0].CreateDataChannel("control", &webrtc.DataChannelInit{Ordered: ptr(true)})
 	if err != nil {
 		die(err)
@@ -931,9 +970,12 @@ func runSend(args []string) {
 		}
 	})
 
-	totalDCs := effectivePCs + 2 // file-N × effectivePCs + 1 control + 1 retransmit
+	totalDCs := effectivePCs + len(relDCs) + 2 // file-N + rel-N per PC, 1 control, 1 retransmit
 	openCh := make(chan struct{}, totalDCs)
 	for _, dc := range dataDCs {
+		dc.OnOpen(func() { openCh <- struct{}{} })
+	}
+	for _, dc := range relDCs {
 		dc.OnOpen(func() { openCh <- struct{}{} })
 	}
 	controlDC.OnOpen(func() { openCh <- struct{}{} })
@@ -953,6 +995,7 @@ func runSend(args []string) {
 	resumeBitmapCh := make(chan []byte, 1)
 	var resumeDelivered atomic.Bool
 	var peerProbeCap atomic.Bool
+	var peerWantsReliable atomic.Bool // receiver asked for reliable data channels
 	probeResultCh := make(chan [2]int64, 1) // {bytesReceived, durationMs}
 
 	controlDC.OnMessage(func(msg webrtc.DataChannelMessage) {
@@ -975,6 +1018,9 @@ func runSend(args []string) {
 		case "resume":
 			if m.Caps["probe"] == 1 {
 				peerProbeCap.Store(true)
+			}
+			if m.Caps["reliable"] == 1 {
+				peerWantsReliable.Store(true)
 			}
 			if resumeDelivered.Swap(true) {
 				return
@@ -1118,6 +1164,9 @@ func runSend(args []string) {
 					peerChunkHint.Store(h)
 					dbgf("[ws] receiver chunk hint: %d\n", h)
 				}
+				if msg.Caps["reliable"] == 1 {
+					peerWantsReliable.Store(true)
+				}
 			case "peer-joined":
 				if prev, _ := remotePeerID.Load().(string); prev != "" && prev != msg.PeerID {
 					// A different receiver took over the room. Everything
@@ -1226,7 +1275,25 @@ func runSend(args []string) {
 	// arrives, and start Phase 1 at 80% of that. Only when the receiver
 	// advertised caps.probe (old clients would choke on the reserved seqs)
 	// and the file is big enough for the probe to pay for itself.
-	cc := newCC(!fl.relay)
+	// Reliable channels only when the receiver asked AND the path is local.
+	// Over a lossy WAN path SCTP's own loss-based congestion control would
+	// crawl, which is exactly what the datagram mode exists to avoid.
+	// BEAMDROP_RELIABLE=1 / =0 forces it either way.
+	useReliable := false
+	if len(relDCs) > 0 {
+		switch os.Getenv("BEAMDROP_RELIABLE") {
+		case "1":
+			useReliable = true
+		case "0":
+		default:
+			useReliable = peerWantsReliable.Load() && routeIsLocal(pcs)
+		}
+	}
+	if useReliable {
+		dataDCs, bufLow = relDCs, relBufLow
+		fmt.Println("Mode: reliable channels (receiver asked for them, local route)")
+	}
+	cc := newCC(!fl.relay && !useReliable)
 	sendTimes := make([]int64, expectedChunks) // unix ms of last send per seq (atomic)
 	if cc.enabled && peerProbeCap.Load() && totalBytes >= probeMinFileSize {
 		ps, _ := json.Marshal(map[string]any{"type": "probe-start", "durationMs": probeDurationMS})

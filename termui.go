@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"strings"
 
@@ -94,4 +95,40 @@ func describeRoute(pcs []*webrtc.PeerConnection) string {
 		return ""
 	}
 	return "Route: " + strings.Join(parts, ", ")
+}
+
+// routeIsLocal reports whether every connection goes directly to a peer on
+// the local network: no relay, and the remote address is private,
+// link-local or unique-local, or shares our /64 (IPv6 global on one LAN).
+func routeIsLocal(pcs []*webrtc.PeerConnection) bool {
+	n := 0
+	for _, pc := range pcs {
+		if pc == nil || pc.SCTP() == nil || pc.SCTP().Transport() == nil || pc.SCTP().Transport().ICETransport() == nil {
+			continue
+		}
+		pair, err := pc.SCTP().Transport().ICETransport().GetSelectedCandidatePair()
+		if err != nil || pair == nil || pair.Local == nil || pair.Remote == nil {
+			return false
+		}
+		if pair.Local.Typ == webrtc.ICECandidateTypeRelay || pair.Remote.Typ == webrtc.ICECandidateTypeRelay {
+			return false
+		}
+		r, err := netip.ParseAddr(pair.Remote.Address)
+		if err != nil {
+			return false
+		}
+		r = r.Unmap()
+		local := r.IsPrivate() || r.IsLinkLocalUnicast() || r.IsLoopback()
+		if !local && r.Is6() {
+			if l, err := netip.ParseAddr(pair.Local.Address); err == nil && l.Is6() {
+				lp, _ := l.Prefix(64)
+				local = lp.Contains(r)
+			}
+		}
+		if !local {
+			return false
+		}
+		n++
+	}
+	return n > 0
 }
