@@ -109,7 +109,15 @@ if ($needInstall) {
     }
 }
 
-# 5. If extra args were supplied (e.g. recv ROOM, send file.mp4), run beamdrop with them.
+# 5. Let beamdrop:// links (the web page's "receive with the app" button) open
+#    this CLI. Per-user registry key, no admin. Best effort: older builds don't
+#    know the command.
+try {
+    & $Target register *> $null
+    if ($LASTEXITCODE -eq 0) { Write-Host "beamdrop:// links will open with this CLI." }
+} catch {}
+
+# 6. If extra args were supplied (e.g. recv ROOM, send file.mp4), run beamdrop with them.
 if ($RestArgs -and $RestArgs.Count -gt 0) {
     Write-Host ""
     & $Target @RestArgs

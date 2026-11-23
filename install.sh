@@ -98,6 +98,13 @@ else
   TARGET="$EXISTING"
 fi
 
+# Let beamdrop:// links (the web page's "receive with the app" button) open
+# this CLI. Per-user, no sudo. Best effort: older builds don't know the
+# command, and headless boxes have no desktop to register with.
+if "$TARGET" register >/dev/null 2>&1; then
+  echo "beamdrop:// links will open with this CLI."
+fi
+
 # If subcommand args were supplied via `sh -s -- ...`, run them.
 if [ "$#" -gt 0 ]; then
   echo

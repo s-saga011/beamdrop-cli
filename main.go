@@ -467,6 +467,10 @@ func main() {
 		runRecv(os.Args[2:])
 	case "update":
 		runUpdate()
+	case "open":
+		runOpen(os.Args[2:])
+	case "register":
+		runRegister(os.Args[2:])
 	case "--version", "-v", "version":
 		fmt.Println(Version)
 		return
@@ -486,6 +490,8 @@ Usage:
   beamdrop recv <url>             # share URL printed by 'send' (must include #k=KEY)
   beamdrop recv <room#k=KEY> [--server URL] [--relay]
   beamdrop update                 # download the latest release in place
+  beamdrop register [--remove]    # let beamdrop:// links (web page's "receive
+                                  # with the app" button) open this CLI
   beamdrop --version              # print current version
 
 Flags:
@@ -499,6 +505,7 @@ Flags:
 
 func die(err error) {
 	fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	holdWindowIfNeeded()
 	os.Exit(1)
 }
 
@@ -728,8 +735,15 @@ func runSend(args []string) {
 		die(fmt.Errorf("prefix hash: %w", err))
 	}
 
+	// Receiver handoff: when a new receiver replaces the old one (the web
+	// page's "receive with the app" button, or simply a reloaded tab), the
+	// previous incarnation of this process re-executed us with the same
+	// room, key and signaling identity — see handoffToNewReceiver.
+	ho := takeHandoff()
 	keyBytes := make([]byte, 32)
-	if _, err := rand.Read(keyBytes); err != nil {
+	if ho != nil {
+		keyBytes = ho.key
+	} else if _, err := rand.Read(keyBytes); err != nil {
 		die(fmt.Errorf("generate key: %w", err))
 	}
 	keyB64 := b64URL.EncodeToString(keyBytes)
@@ -738,8 +752,10 @@ func runSend(args []string) {
 		die(err)
 	}
 
-	room, err := createRoom(server)
-	if err != nil {
+	var room string
+	if ho != nil {
+		room = ho.room
+	} else if room, err = createRoom(server); err != nil {
 		die(fmt.Errorf("createRoom: %w", err))
 	}
 	shareURL := fmt.Sprintf("%s/r/%s#k=%s", server, room, keyB64)
@@ -749,7 +765,9 @@ func runSend(args []string) {
 		// pick a faster (UDP) candidate that the carrier then shapes anyway.
 		shareURL += "&relay=1"
 	}
-	printShareInstructions(room, shareURL)
+	if ho == nil {
+		printShareInstructions(room, shareURL)
+	}
 
 	iceServers, err := fetchICE(server)
 	if err != nil {
@@ -769,7 +787,11 @@ func runSend(args []string) {
 		fmt.Println("Relay mode: forcing all traffic through TURN over TLS:443")
 	}
 
-	ws, err := dialSignaling(server, room, newPeerToken())
+	peerToken := newPeerToken()
+	if ho != nil {
+		peerToken = ho.token // same peerId server-side: the new receiver sees no churn
+	}
+	ws, err := dialSignaling(server, room, peerToken)
 	if err != nil {
 		die(fmt.Errorf("dial signaling: %w", err))
 	}
@@ -998,6 +1020,33 @@ func runSend(args []string) {
 		}
 	})
 
+	sendOffers := func(peerID string) {
+		remotePeerID.Store(peerID)
+		for i, pc := range pcs {
+			pcIdx := i
+			p := pc
+			go func() {
+				offer, err := p.CreateOffer(nil)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "[pc%d] CreateOffer error: %v\n", pcIdx, err)
+					return
+				}
+				if err := p.SetLocalDescription(offer); err != nil {
+					fmt.Fprintf(os.Stderr, "[pc%d] SetLocalDescription error: %v\n", pcIdx, err)
+					return
+				}
+				fmt.Fprintf(os.Stderr, "[pc%d] sending offer to %s\n", pcIdx, peerID)
+				_ = ws.write(sigMsg{Type: "offer", To: peerID, SDP: &offer, PcIdx: ptr(pcIdx)})
+			}()
+		}
+	}
+	if ho != nil {
+		// The new receiver joined before this process existed, so no
+		// peer-joined will arrive for it — offer right away.
+		fmt.Printf("Receiver changed — restarting the transfer for the new receiver.\n")
+		sendOffers(ho.peer)
+	}
+
 	wsErr := make(chan error, 1)
 	go func() {
 		for {
@@ -1037,26 +1086,14 @@ func runSend(args []string) {
 					fmt.Fprintf(os.Stderr, "[ws] receiver chunk hint: %d\n", h)
 				}
 			case "peer-joined":
-				fmt.Fprintf(os.Stderr, "[ws] peer-joined → creating offer for %d pc(s)\n", len(pcs))
-				remotePeerID.Store(msg.PeerID)
-				for i, pc := range pcs {
-					pcIdx := i
-					p := pc
-					go func() {
-						offer, err := p.CreateOffer(nil)
-						if err != nil {
-							fmt.Fprintf(os.Stderr, "[pc%d] CreateOffer error: %v\n", pcIdx, err)
-							return
-						}
-						if err := p.SetLocalDescription(offer); err != nil {
-							fmt.Fprintf(os.Stderr, "[pc%d] SetLocalDescription error: %v\n", pcIdx, err)
-							return
-						}
-						rid, _ := remotePeerID.Load().(string)
-						fmt.Fprintf(os.Stderr, "[pc%d] sending offer to %s\n", pcIdx, rid)
-						_ = ws.write(sigMsg{Type: "offer", To: rid, SDP: &offer, PcIdx: ptr(pcIdx)})
-					}()
+				if prev, _ := remotePeerID.Load().(string); prev != "" && prev != msg.PeerID {
+					// A different receiver took over the room. Everything
+					// in flight was addressed to the old one; start clean.
+					handoffToNewReceiver(handoff{room: room, key: keyBytes, token: peerToken, peer: msg.PeerID}, ws, pcs)
+					return
 				}
+				fmt.Fprintf(os.Stderr, "[ws] peer-joined → creating offer for %d pc(s)\n", len(pcs))
+				sendOffers(msg.PeerID)
 			case "answer":
 				if msg.SDP != nil && pcs[idx] != nil {
 					_ = pcs[idx].SetRemoteDescription(*msg.SDP)
@@ -1066,12 +1103,12 @@ func runSend(args []string) {
 					_ = pcs[idx].AddICECandidate(*msg.Candidate)
 				}
 			case "peer-left":
+				// Not fatal: the receiver may be switching to the CLI (or
+				// reloading). Keep listening — a new peer-joined restarts
+				// the transfer for it; if nobody comes, the stall watchdog
+				// (or the 10-minute connect timeout) ends the wait.
 				if !transferComplete.Load() {
-					select {
-					case wsErr <- fmt.Errorf("receiver disconnected"):
-					default:
-					}
-					return
+					fmt.Fprintf(os.Stderr, "\nReceiver left — waiting for it (or a new receiver) to join...\n")
 				}
 			case "error":
 				select {
@@ -2615,6 +2652,17 @@ func runRecv(args []string) {
 					}
 				}()
 			case "error":
+				// Taking over from a browser tab (beamdrop:// link): the tab
+				// has left, but the server holds its slot for a reconnect
+				// grace period. Keep knocking — the socket was closed on us,
+				// so the next read fails and re-dials.
+				if msg.Reason == "room_full" && waitForRoom && roomFullTries < 60 {
+					if roomFullTries == 0 {
+						fmt.Println("Waiting for the previous receiver to leave the room (up to ~40s)...")
+					}
+					roomFullTries++
+					continue
+				}
 				select {
 				case transferDone <- fmt.Errorf("signaling error: %s", msg.Reason):
 				default:
