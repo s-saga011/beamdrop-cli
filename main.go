@@ -43,6 +43,7 @@ import (
 	"io"
 	"math"
 	"math/bits"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	"net/netip"
@@ -63,26 +64,28 @@ import (
 
 // Version is set via -ldflags "-X main.Version=v0.2.0" at build time;
 // the const fallback keeps `beamdrop --version` honest when run from `go run`.
-var Version = "v0.9.1"
+var Version = "v0.9.2"
 
 const (
-	chunkSize             = 16 * 1024
-	bufferedHigh          = 4 * 1024 * 1024
-	bufferedLow           = 1 * 1024 * 1024
-	numPCs                = 4
-	extraReliablePCs      = 4 // added for browser receivers in reliable mode
-	seqHeaderBytes        = 4
-	ivLength              = 12
-	prefixHashSize        = 4096
-	probeSeqBase          = 0xFFF00000 // data frames with seq >= this are bandwidth-probe dummies
-	bitmapInterval        = 200 * time.Millisecond
-	retransmitInterval    = 250 * time.Millisecond
-	maxRetransmitInterval = 8 * time.Second // back off up to this when receiver isn't keeping up
-	maxRetransmitPasses   = 60
-	retransmitBatchLimit  = 2000 // chunks per pass — keep small so receiver can drain between passes
-	retransmitBatchMin    = 200  // floor when we shrink the batch under loss
-	stagnantPassThreshold = 12   // ~3s of "no progress" passes before bailing
-	relayInflightWindow   = 1000 // chunks (16MB) — relay-only cap, since pion bufferedAmount under-reports on TCP/TLS
+	chunkSize              = 16 * 1024
+	bufferedHigh           = 4 * 1024 * 1024
+	bufferedLow            = 1 * 1024 * 1024
+	numPCs                 = 4
+	extraReliablePCs       = 4 // added for browser receivers in reliable mode
+	seqHeaderBytes         = 4
+	ivLength               = 12
+	prefixHashSize         = 4096
+	probeSeqBase           = 0xFFF00000 // data frames with seq >= this are bandwidth-probe dummies
+	bitmapInterval         = 200 * time.Millisecond
+	retransmitInterval     = 250 * time.Millisecond
+	maxRetransmitInterval  = 8 * time.Second // back off up to this when receiver isn't keeping up
+	maxRetransmitPasses    = 60
+	retransmitBatchLimit   = 2000 // chunks per pass — keep small so receiver can drain between passes
+	retransmitBatchMin     = 200  // floor when we shrink the batch under loss
+	retransmitGraceMS      = 1200 // paced resends: don't re-send a chunk sent less than this ago
+	retransmitReliableTail = 300  // this few chunks left: finish on the reliable channel
+	stagnantPassThreshold  = 12   // ~3s of "no progress" passes before bailing
+	relayInflightWindow    = 1000 // chunks (16MB) — relay-only cap, since pion bufferedAmount under-reports on TCP/TLS
 
 	// Phase E/F: sender-side bandwidth probe + congestion control (datagram
 	// path only — reliable/relay DCs already have SCTP's own CC).
@@ -1815,6 +1818,7 @@ func runSend(args []string) {
 	}
 
 	var reportProgress func()
+	testDropPct, _ := strconv.Atoi(os.Getenv("BEAMDROP_TEST_DROP_PCT"))
 	sendChunk := func(dc *webrtc.DataChannel, ch chan struct{}, seq uint32, plaintext []byte) error {
 		ct := encryptChunk(aead, plaintext, seq, 0) // CLI send is single-file (fileIdx 0)
 		out := make([]byte, seqHeaderBytes+len(ct))
@@ -1836,7 +1840,11 @@ func runSend(args []string) {
 			case <-time.After(500 * time.Millisecond):
 			}
 		}
-		if err := dc.Send(out); err != nil {
+		// Test hook: BEAMDROP_TEST_DROP_PCT=N silently drops N% of the chunks
+		// on the datagram channels (a lossy path without needing one).
+		if testDropPct > 0 && cc.enabled && dc != retransmitDC && mrand.Intn(100) < testDropPct {
+			// dropped
+		} else if err := dc.Send(out); err != nil {
 			return err
 		}
 		if int(seq) < len(sendTimes) {
@@ -2161,6 +2169,7 @@ func runSend(args []string) {
 	stagnant := 0
 	prevReceivedBits := 0
 	prevAttempted := 0
+	prevPaced := false
 	curInterval := retransmitInterval
 	curBatchLimit := retransmitBatchLimit
 	var goneSince time.Time
@@ -2200,7 +2209,9 @@ func runSend(args []string) {
 		curReceivedBits := countSetBits(bm)
 
 		// Adjust pacing based on the last pass's effective delivery ratio.
-		if prevAttempted > 0 {
+		// (Not for paced resends: the congestion control does the pacing,
+		// and the tail of each batch is legitimately not reported yet.)
+		if prevAttempted > 0 && !prevPaced {
 			landed := curReceivedBits - prevReceivedBits
 			if landed < 0 {
 				landed = 0
@@ -2223,14 +2234,36 @@ func runSend(args []string) {
 			}
 		}
 
+		// Datagram mode (cc.enabled): the resends go out on the same
+		// unreliable channels as the first pass, paced by the same congestion
+		// control. They used to go down the single reliable "retransmit"
+		// channel, whose SCTP congestion control collapses on a lossy path:
+		// measured over a phone's VPN, 12.6% of a 5.9GB file took 6 of the
+		// 15 minutes at ~2.5 MB/s while the first pass ran at ~10.
+		// A chunk re-sent moments ago is not in the bitmap yet; leave it
+		// alone until the receiver had time to report it.
+		// The last few hundred chunks go down the reliable channel after
+		// all: it never loses one, so the tail does not take a dozen
+		// ever-smaller rounds, and the volume is too small to matter.
+		paced := cc.enabled && os.Getenv("BEAMDROP_RETRANSMIT_RELIABLE") != "1" &&
+			expectedChunks-curReceivedBits > retransmitReliableTail
+		nowMS := time.Now().UnixMilli()
+		inFlight := 0
 		var missing []uint32
 		for s := 0; s < expectedChunks; s++ {
 			if !getBit(bm, s) {
+				if paced && nowMS-atomic.LoadInt64(&sendTimes[s]) < retransmitGraceMS {
+					inFlight++
+					continue
+				}
 				missing = append(missing, uint32(s))
 				if len(missing) >= curBatchLimit {
 					break
 				}
 			}
+		}
+		if len(missing) == 0 && inFlight > 0 {
+			continue // everything outstanding is still on its way
 		}
 		if len(missing) == 0 {
 			prevAttempted = 0
@@ -2250,6 +2283,7 @@ func runSend(args []string) {
 		}
 		prevReceivedBits = curReceivedBits
 		prevAttempted = len(missing)
+		prevPaced = paced
 		pass++
 		fmt.Printf("\n  retransmit pass %d: %d missing (rcv has %d/%d, batch=%d, wait=%s)\n",
 			pass, len(missing), curReceivedBits, expectedChunks, curBatchLimit, curInterval)
@@ -2257,7 +2291,7 @@ func runSend(args []string) {
 		if err != nil {
 			die(fmt.Errorf("reopen for retransmit: %w", err))
 		}
-		for _, s := range missing {
+		for i, s := range missing {
 			if transferComplete.Load() {
 				break
 			}
@@ -2277,6 +2311,14 @@ func runSend(args []string) {
 			// Send retransmits through the dedicated reliable DC. SCTP's
 			// own retransmit handles wire loss; we don't need to re-queue
 			// from this end, just push once and trust the lower layer.
+			if paced {
+				cc.consume(len(pt), abortSig)
+				k := i % len(dataDCs)
+				if err := sendChunk(dataDCs[k], bufLow[k], s, pt); err != nil {
+					break
+				}
+				continue
+			}
 			if err := sendChunk(retransmitDC, retransmitBufLow, s, pt); err != nil {
 				break
 			}
