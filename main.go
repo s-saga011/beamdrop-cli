@@ -108,6 +108,7 @@ const (
 	defaultServer     = "https://p2p.draft-publish.com"
 	stallTimeout      = 30 * time.Second // stalled this long → try ICE restart (VPN/network change)
 	stallHardTimeout  = 3 * time.Minute  // stalled this long → give up for real
+	stallRejoinAfter  = 20 * time.Second // after stallTimeout: ICE restarts failed → rejoin as a new sender
 	statsInterval     = 2 * time.Second  // sender->server stats cadence
 )
 
@@ -787,6 +788,8 @@ func runSend(args []string) {
 	}
 	if ho == nil {
 		printShareInstructions(room, shareURL)
+	} else if ho.rejoin {
+		fmt.Printf("Reconnecting (room %s, same share link).\n", room)
 	} else if takeover {
 		// The share link already exists (the page made it) - no box, no QR.
 		fmt.Printf("Taking over the send from the browser (room %s, same share link).\n", room)
@@ -1591,6 +1594,18 @@ func runSend(args []string) {
 						}
 					}
 				}
+				// ICE restarts had their chance (several attempts since
+				// stallTimeout). BEAMDROP_NO_REJOIN=1 keeps the old behaviour.
+				if d >= stallTimeout+stallRejoinAfter && os.Getenv("BEAMDROP_NO_REJOIN") != "1" && !receiverGone.Load() {
+					extraMu.Lock()
+					all := append([]*webrtc.PeerConnection{}, pcs...)
+					for _, pc := range extraPCs {
+						all = append(all, pc)
+					}
+					extraMu.Unlock()
+					rejoinAsNewSender(room, keyBytes, sendChunkSize, ws, all)
+					return
+				}
 				if d >= stallHardTimeout {
 					abort(fmt.Sprintf("no progress for %s despite reconnect attempts", stallHardTimeout))
 					return
@@ -1999,6 +2014,14 @@ func runSend(args []string) {
 	// Test hook: BEAMDROP_TEST_ICERESTART=1 forces an ICE restart on every
 	// PC 3s into the transfer, to exercise the renegotiation path without
 	// physically changing networks.
+	// Test hook: BEAMDROP_TEST_REJOIN=N leaves and rejoins as a new sender N
+	// seconds into the transfer (once), as the stall watchdog would.
+	if n, _ := strconv.Atoi(os.Getenv("BEAMDROP_TEST_REJOIN")); n > 0 && (ho == nil || !ho.rejoin) {
+		go func() {
+			time.Sleep(time.Duration(n) * time.Second)
+			rejoinAsNewSender(room, keyBytes, sendChunkSize, ws, pcs)
+		}()
+	}
 	if os.Getenv("BEAMDROP_TEST_ICERESTART") == "1" {
 		go func() {
 			time.Sleep(3 * time.Second)

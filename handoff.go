@@ -3,7 +3,9 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 )
@@ -23,6 +25,11 @@ type handoff struct {
 	takeover bool
 	chunk    int64
 	name     string
+
+	// rejoin: our own connections to the receiver broke for good and ICE
+	// restarts did not bring them back (see rejoinAsNewSender). Handled like
+	// a takeover - of ourselves.
+	rejoin bool
 }
 
 // pendingTakeover is set by `beamdrop open` for a /s/ link, in-process.
@@ -49,6 +56,10 @@ func takeHandoff() *handoff {
 	if err != nil || len(key) != 32 {
 		return nil
 	}
+	if chunk, ok := strings.CutPrefix(f[3], "rejoin:"); ok && f[2] == "" {
+		n, _ := strconv.ParseInt(chunk, 10, 64)
+		return &handoff{room: f[0], key: key, takeover: true, rejoin: true, chunk: n}
+	}
 	return &handoff{room: f[0], key: key, token: f[2], peer: f[3]}
 }
 
@@ -69,5 +80,29 @@ func handoffToNewReceiver(h handoff, ws *safeWS, pcs []*webrtc.PeerConnection) {
 	}
 	if err := reexec(env); err != nil {
 		die(fmt.Errorf("restart for new receiver failed: %w", err))
+	}
+}
+
+// rejoinAsNewSender is the last resort when the connections to the receiver
+// are broken and ICE restarts do not revive them (seen with a phone on a VPN:
+// we would report "connected" again, the phone never did, and the transfer
+// sat at 72% until the 3 minute abort). We leave the room and come back as a
+// brand-new sender: the receiver's page drops its dead connections, keeps
+// what it has, and its bitmap makes us resume where it stopped - the same
+// path as taking a send over from a web page.
+func rejoinAsNewSender(room string, key []byte, chunk int64, ws *safeWS, pcs []*webrtc.PeerConnection) {
+	fmt.Fprintf(os.Stderr, "\n[stall] the connection did not come back - reconnecting from scratch (the transfer resumes where it stopped)\n")
+	env := append(os.Environ(), handoffEnv+"="+strings.Join(
+		[]string{room, b64URL.EncodeToString(key), "", "rejoin:" + strconv.FormatInt(chunk, 10)}, "\n"))
+	_ = ws.write(sigMsg{Type: "leave"}) // frees our slot at once (no reconnect grace)
+	time.Sleep(300 * time.Millisecond)
+	ws.close()
+	for _, pc := range pcs {
+		if pc != nil {
+			_ = pc.Close()
+		}
+	}
+	if err := reexec(env); err != nil {
+		die(fmt.Errorf("restart failed: %w", err))
 	}
 }
